@@ -140,6 +140,16 @@
 
   function quotaLeft() { return Math.max(0, quotaLimit() - quotaUsed()); }
 
+  /**
+   * Сервер сказал, что лимит кончился (403). Наш счётчик может считать иначе:
+   * встроенный токен общий на всех, кто поставил плагин, поэтому его сутки
+   * расходуют чужие устройства. Верим серверу и закрываем сеть до конца суток —
+   * иначе каждый ряд продолжит уходить в заведомый 403.
+   */
+  function quotaExhaust() {
+    storageSet('kp_quota', { day: todayStamp(), used: quotaLimit() });
+  }
+
   // ===========================================================================
   // Сетевой слой
   //
@@ -213,7 +223,8 @@
     // хуже вчерашних данных.
     if (quotaLeft() <= 0) {
       var stale = cacheGetStale(key);
-      notyOnce('kp_quota_noted', 'Кинопоиск: исчерпан суточный лимит запросов (' + quotaLimit() + '). Показаны сохранённые данные.');
+      notyOnce('kp_quota_noted', 'Кинопоиск: суточный лимит запросов исчерпан (' + quotaLimit() + '). ' +
+        'Вставьте свой токен в Настройки → Кинопоиск (бот @poiskkinodev_bot). Показаны сохранённые данные.');
       if (stale !== null) done(stale);
       else fail({ status: 429, quota: true });
       return;
@@ -231,7 +242,16 @@
       }, function (xhr) {
         release();
         var status = (xhr && (xhr.status || xhr.decode_code)) || 0;
-        if (status === 401 || status === 403) notyOnce('kp_auth_noted', 'Кинопоиск: токен не принят (' + status + '). Проверьте его в настройках плагина.');
+        // Кинопоиск различает эти два случая, и путать их нельзя: 401 — токен
+        // неверный, 403 — токен верный, но суточный лимит уже израсходован.
+        // Одно сообщение на оба заставляло бы менять исправный токен.
+        if (status === 403) {
+          quotaExhaust();
+          notyOnce('kp_quota_noted', 'Кинопоиск: суточный лимит запросов исчерпан. ' +
+            'Вставьте свой токен в Настройки → Кинопоиск (бот @poiskkinodev_bot). Пока показаны сохранённые данные.');
+        } else if (status === 401) {
+          notyOnce('kp_auth_noted', 'Кинопоиск: токен некорректен. Проверьте его в Настройки → Кинопоиск.');
+        }
         var old = cacheGetStale(key);
         if (old !== null) done(old);
         else fail({ status: status || -1 });
@@ -1064,6 +1084,7 @@
       _quotaUsed: quotaUsed,
       _quotaLeft: quotaLeft,
       _quotaSpend: quotaSpend,
+      _quotaExhaust: quotaExhaust,
       _cacheGet: cacheGet,
       _cacheSet: cacheSet,
       _cacheClear: cacheClear,

@@ -113,13 +113,59 @@ test('an HTTP error falls back to the stale copy rather than an empty screen', a
   assert.strictEqual(second.docs[0].name, 'ok');
 });
 
-test('a 401 tells the user the token was rejected', async () => {
+// Kinopoisk uses two different statuses that must never be conflated:
+//   401 -> {"message":"Переданный токен некорректен!"}
+//   403 -> {"message":"Вы израсходовали ваш суточный лимит по запросам..."}
+// Reporting 403 as a bad token sends the user off to replace a working token.
+
+test('a 401 says the token itself is wrong', async () => {
   const mock = makeMock({ responder: () => ({ __error: 401 }) });
   const { _get } = loadPlugin(mock);
 
   await new Promise((resolve) => _get('row', 'v1.4/movie?a=1', 60, identity, resolve, resolve));
 
-  assert.ok(mock.calls.noty.some((m) => m.indexOf('токен') >= 0), 'expected a token warning, got: ' + JSON.stringify(mock.calls.noty));
+  const noty = mock.calls.noty.join(' ');
+  assert.ok(/некорректен/.test(noty), 'expected a bad-token warning, got: ' + noty);
+  assert.ok(!/лимит/.test(noty), 'must not blame the daily limit for a bad token');
+});
+
+test('a 403 says the daily limit ran out, NOT that the token is bad', async () => {
+  const mock = makeMock({ responder: () => ({ __error: 403 }) });
+  const { _get } = loadPlugin(mock);
+
+  await new Promise((resolve) => _get('row', 'v1.4/movie?a=1', 60, identity, resolve, resolve));
+
+  const noty = mock.calls.noty.join(' ');
+  assert.ok(/лимит/.test(noty), 'expected a quota warning, got: ' + noty);
+  assert.ok(!/некорректен/.test(noty), 'a 403 means the token works — never call it invalid');
+});
+
+test('a 403 closes the network for the rest of the day', async () => {
+  // The built-in token is shared, so other people can exhaust it while this
+  // device still thinks it has budget. The server is the authority.
+  const mock = makeMock({ responder: () => ({ __error: 403 }) });
+  const { _get, _quotaLeft } = loadPlugin(mock);
+
+  await new Promise((resolve) => _get('row', 'v1.4/movie?a=1', 60, identity, resolve, resolve));
+  assert.strictEqual(_quotaLeft(), 0, 'the local counter must follow the server');
+
+  await new Promise((resolve) => _get('row', 'v1.4/movie?b=2', 60, identity, resolve, resolve));
+  assert.strictEqual(mock.calls.requests.length, 1, 'no further request may be attempted after a 403');
+});
+
+test('after a 403 the cached feed still opens', async () => {
+  let limited = false;
+  const mock = makeMock({
+    responder: () => (limited ? { __error: 403 } : { docs: [{ id: 1, name: 'кино' }], page: 1, pages: 1 })
+  });
+  const { _get } = loadPlugin(mock);
+
+  await new Promise((done) => _get('row', 'v1.4/movie?a=1', 0, identity, done, done));
+  limited = true;
+  const after = await new Promise((resolve) => _get('row', 'v1.4/movie?a=1', 0, identity, resolve, () => resolve(null)));
+
+  assert.ok(after, 'the stale copy must still be served once the quota is gone');
+  assert.strictEqual(after.docs[0].name, 'кино');
 });
 
 test('an unparsable response fails instead of caching garbage', async () => {
