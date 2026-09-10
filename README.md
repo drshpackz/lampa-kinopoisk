@@ -132,10 +132,13 @@ Lampa.Api.sources.kp = { main, list, category, full, search, discovery,
 ## Тесты
 
 ```bash
-npm test                          # 73 юнит-теста на моке Lampa, без сети
-node test/live/live-check.js      # живая проверка против api.poiskkino.dev (~13 запросов)
-node test/live/browser-check.js   # плагин внутри настоящей Lampa в браузере
+npm test              # 70 юнит-тестов на моке Lampa: без сети и без расхода квоты
+npm run test:live     # живая проверка против api.poiskkino.dev (~13 запросов из 200)
+npm run test:browser  # плагин внутри настоящей Lampa в браузере (~8 запросов)
 ```
+
+`npm test` намеренно ограничен `test/*.test.js`: живые проверки тратят реальную
+суточную квоту, поэтому запускаются только вручную.
 
 Юнит-тесты гоняют плагин на моке Lampa (`test/helpers/lampa-mock.js`) — они
 быстрые и ничего не тратят, но мок не скажет, что запрос составлен неверно.
@@ -152,7 +155,7 @@ node test/live/browser-check.js   # плагин внутри настоящей
   ```bash
   git clone --depth=1 https://github.com/yumata/lampa /tmp/lampa
   python3 -m http.server 8901 --directory /tmp/lampa &
-  NODE_PATH=<путь к node_modules с playwright> node test/live/browser-check.js
+  NODE_PATH=<путь к node_modules с playwright> npm run test:browser
   ```
 
   Скриншоты кладутся в `test/live/shots/`.
