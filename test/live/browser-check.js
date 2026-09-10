@@ -59,6 +59,13 @@ function check(label, ok, detail) {
   check('Lampa booted', true, 'v' + (await page.evaluate(() => Lampa.Manifest.app_digital + '')));
 
   console.log('\n1. plugin installs into the running app');
+  // Tokens live in Lampa.Storage, exactly where the settings screen puts them.
+  if (process.env.KPU_TOKEN || process.env.KP_TOKEN) {
+    await page.evaluate((t) => {
+      if (t.kpu) Lampa.Storage.set('kp_token_unofficial', t.kpu);
+      if (t.dev) Lampa.Storage.set('kp_token', t.dev);
+    }, { kpu: process.env.KPU_TOKEN || '', dev: process.env.KP_TOKEN || '' });
+  }
   await page.evaluate(PLUGIN);
   const installed = await page.evaluate(() => ({
     source: !!(Lampa.Api.sources.kp && Lampa.Api.sources.kp.SOURCE_NAME === 'kp'),
@@ -100,11 +107,15 @@ function check(label, ok, detail) {
       id: card.id, method: card.original_name ? 'tv' : 'movie', card: card, page: 1
     }), found.first);
 
-    await page.waitForFunction(() =>
-      Lampa.Activity.active().component === 'full' &&
-      Lampa.Activity.active().source === 'kp' &&
-      !!Lampa.Activity.active().activity.render().find('.full-start-new__title, .full-start__title').length
-    ).catch(() => {});
+    // The title element exists in the template before the data lands, so
+    // waiting for the element alone measures an empty page. Wait for text.
+    const rendered = await page.waitForFunction(() => {
+      const act = Lampa.Activity.active();
+      if (act.component !== 'full' || act.source !== 'kp') return false;
+      const t = act.activity.render().find('.full-start-new__title, .full-start__title');
+      return !!(t.length && t.text().trim());
+    }, null, { timeout: 45000 }).then(() => true).catch(() => false);
+    check('card finished loading', rendered, rendered ? 'title rendered' : 'still loading after 45s');
 
     const full = await page.evaluate(() => {
       const act = Lampa.Activity.active();
@@ -130,14 +141,30 @@ function check(label, ok, detail) {
     check('poster is a Kinopoisk value, not a Lampa-built TMDB url', !!full.poster && !built(full.poster), (full.poster || '(none)').slice(0, 70));
     check('the Kinopoisk rating is shown once', full.badges.filter((b) => /KP$/i.test(b)).length <= 1, full.badges.join('  |  '));
 
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(3000);
+    // The src attribute only proves we handed Lampa the right URL. What matters
+    // to a viewer is whether the image painted.
+    const painted = await page.evaluate(() => {
+      const img = Lampa.Activity.active().activity.render()[0]
+        .querySelector('.full-start__poster img, .full-start-new__poster img');
+      return img ? { w: img.naturalWidth, h: img.naturalHeight } : null;
+    });
+    check('the poster actually painted', !!(painted && painted.w > 0),
+      painted ? (painted.w + '×' + painted.h) : 'no image element');
+
     await page.screenshot({ path: path.join(SHOTS, 'card.png') });
   }
 
   console.log('\n4. no plugin-side errors');
   // A bare localhost Lampa always 404s/500s on its own account, cub and
   // extension endpoints; only an API or plugin-thrown error is ours.
-  const ours = errors.filter((e) => /poiskkino|kinopoiskapiunofficial/i.test(e) || /^pageerror/.test(e));
+  // Kinopoisk's image hosts send no Access-Control-Allow-Origin, so Lampa's
+  // image machinery logs a CORS complaint even though a plain <img> renders
+  // fine (verified above: the poster paints). That noise is not ours; a thrown
+  // exception or a failed API call is.
+  const ours = errors.filter((e) =>
+    (/poiskkino|kinopoiskapiunofficial/i.test(e) && !/blocked by CORS policy/i.test(e)) ||
+    /^pageerror/.test(e));
   check('console clean', ours.length === 0, ours.slice(0, 3).join(' // ') || 'clean');
 
   console.log('\nScreenshots: ' + SHOTS);

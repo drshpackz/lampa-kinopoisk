@@ -143,3 +143,82 @@ test('actors from kinopoisk.dev land in cast, everyone else in crew', () => {
   assert.strictEqual(p.crew.length, 1);
   assert.strictEqual(p.crew[0].job, 'Director', 'Lampa looks for the English job name');
 });
+
+
+// ---------------------------------------------------------------------------
+// Edge cases the live API actually produces (verified against real responses):
+// nameOriginal comes back as an empty string for Russian titles, and episode
+// fields come back as null.
+// ---------------------------------------------------------------------------
+
+test('a series whose original name is empty still routes as a series', () => {
+  // «Завод» (TV_SERIES) has nameOriginal: '' and nameEn: null. An empty
+  // original_name would make Lampa open it as a movie — no seasons, no episodes.
+  const { _unofficialCard, _devCard } = load();
+
+  const kpu = _unofficialCard({ filmId: 5253113, nameRu: 'Завод', nameEn: null, nameOriginal: '', type: 'TV_SERIES', year: '2023' });
+  assert.strictEqual(kpu.name, 'Завод');
+  assert.ok(kpu.original_name, 'original_name must not be empty: ' + JSON.stringify(kpu.original_name));
+  assert.strictEqual(kpu.title, undefined);
+
+  const dev = _devCard(devSeriesDoc({ name: 'Завод', alternativeName: '', enName: '' }));
+  assert.ok(dev.original_name);
+});
+
+test('a movie with no original title falls back to the Russian one', () => {
+  const { _unofficialCard } = load();
+  const card = _unofficialCard({ kinopoiskId: 993591, nameRu: 'Завод', nameEn: '', nameOriginal: '', type: 'FILM', year: 2018 });
+  assert.strictEqual(card.title, 'Завод');
+  assert.strictEqual(card.original_title, 'Завод');
+});
+
+test('a nameless document is dropped rather than rendered as a blank card', () => {
+  const { _unofficialCard, _devCard } = load();
+  assert.strictEqual(_unofficialCard({ filmId: 1, nameRu: '', nameEn: '', nameOriginal: '' }), null);
+  assert.strictEqual(_devCard({ id: 1 }), null);
+});
+
+test('episodes with null fields get readable fallbacks', () => {
+  // The real seasons response returns nameRu, synopsis and releaseDate as null.
+  const { _KPU } = load();
+  const map = _KPU.parseSeasons({ items: [{ number: 1, episodes: [
+    { seasonNumber: 1, episodeNumber: 1, nameRu: null, nameEn: null, synopsis: null, releaseDate: null }
+  ] }] });
+
+  assert.strictEqual(map[1].episodes[0].name, 'Серия 1');
+  assert.strictEqual(map[1].episodes[0].overview, '');
+  assert.strictEqual(map[1].episodes[0].air_date, '');
+});
+
+
+test('CONTRACT: a full movie object carries every array Lampa dereferences unguarded', () => {
+  // Lampa's description module does `card.genres.length` and
+  // `card.production_companies.length` with no undefined check. A missing array
+  // throws inside Lampa, the exception is swallowed, and the card stays on the
+  // loading spinner forever — no console error a user would ever see.
+  const { _devMovie, _KPU } = load();
+  const movies = [
+    _devMovie(devDoc()),
+    _devMovie(devSeriesDoc()),
+    _KPU.parseFull(unofficialFilmDoc()).movie
+  ];
+
+  movies.forEach((m) => {
+    ['genres', 'production_companies', 'production_countries'].forEach((field) => {
+      assert.ok(Array.isArray(m[field]), field + ' must be an array, got ' + typeof m[field]);
+    });
+  });
+});
+
+test('a title with no companies still gets an empty array, not undefined', () => {
+  const { _devMovie, _KPU } = load();
+  assert.deepStrictEqual(_devMovie(devDoc({ networks: null })).production_companies, []);
+  assert.deepStrictEqual(_KPU.parseFull(unofficialFilmDoc()).production_companies, undefined);
+  assert.deepStrictEqual(_KPU.parseFull(unofficialFilmDoc()).movie.production_companies, []);
+});
+
+test('networks from kinopoisk.dev become production companies', () => {
+  const { _devMovie } = load();
+  const m = _devMovie(devSeriesDoc({ networks: { items: [{ name: 'HBO' }] } }));
+  assert.deepStrictEqual(m.production_companies.map((c) => c.name), ['HBO']);
+});

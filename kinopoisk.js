@@ -70,11 +70,14 @@
     var date = year ? (year + '-01-01') : '';
     if (series) {
       card.name = ru;
-      card.original_name = orig;
+      // Роутинг сериала держится на НЕПУСТОМ original_name, а Кинопоиск
+      // регулярно отдаёт оригинальное название пустой строкой у российских
+      // тайтлов. Пустое поле открыло бы сериал как фильм — без сезонов.
+      card.original_name = orig || ru;
       card.first_air_date = date;
     } else {
       card.title = ru;
-      card.original_title = orig;
+      card.original_title = orig || ru;
       card.release_date = date;
     }
     return card;
@@ -127,6 +130,7 @@
     var rating = doc.rating || {}, votes = doc.votes || {};
     var ru = doc.name || doc.alternativeName || doc.enName || '';
     var orig = doc.alternativeName || doc.enName || doc.name || '';
+    if (!ru) return null;
     var year = doc.year || (doc.releaseYears && doc.releaseYears[0] && doc.releaseYears[0].start);
 
     var card = baseCard(doc.id);
@@ -184,6 +188,15 @@
     card.production_countries = [];
     for (i = 0; i < countries.length; i++) card.production_countries.push({ name: countries[i].name });
     card.origin_country = card.production_countries;
+
+    // Lampa читает card.production_companies.length БЕЗ проверки на undefined
+    // (модуль описания полной карточки), поэтому массив обязан существовать,
+    // даже пустой — иначе карточка навсегда остаётся в состоянии загрузки.
+    card.production_companies = [];
+    for (i = 0; i < ((doc.networks && doc.networks.items) || []).length; i++) {
+      card.production_companies.push({ id: i, name: doc.networks.items[i].name });
+    }
+
     card.tagline = doc.slogan || '';
     card.runtime = doc.movieLength || doc.seriesLength || 0;
     return card;
@@ -287,9 +300,11 @@
     var id = unofficialId(doc);
     if (id == null) return null;
 
+    // Пустые строки и null здесь обычное дело, поэтому порядок важен.
     var ru = doc.nameRu || doc.nameEn || doc.nameOriginal || '';
     var orig = doc.nameOriginal || doc.nameEn || doc.nameRu || '';
     var year = parseInt(doc.year, 10) || 0;
+    if (!ru) return null;
 
     var card = baseCard(id);
     card.overview = doc.description || doc.shortDescription || '';
@@ -345,6 +360,7 @@
       card.production_countries = [];
       for (i = 0; i < countries.length; i++) card.production_countries.push({ name: countries[i] });
       card.origin_country = card.production_countries;
+      card.production_companies = []; // см. комментарий в devMovie: Lampa не проверяет
       card.tagline = json.slogan || '';
       card.runtime = parseInt(json.filmLength, 10) || 0;
 
