@@ -2,32 +2,37 @@
   'use strict';
 
   // ===========================================================================
-  // Кинопоиск для Lampa
+  // Кинопоиск для Lampa — вкладка в поиске
   //
-  // Плагин регистрирует полноценный источник данных `kp` в Lampa.Api.sources,
-  // поэтому Кинопоиск работает везде, где работает TMDB: главная лента, полная
-  // сетка «ещё», карточка фильма, поиск, актёры, сезоны и серии.
+  // Плагин добавляет «Кинопоиск» в общий поиск Lampa и умеет открыть карточку
+  // найденного тайтла (с сезонами и сериями). Каталога и пункта меню нет
+  // намеренно: лента из 22 рядов стоила два десятка запросов на одно открытие,
+  // а бесплатные токены Кинопоиска считаются сотнями запросов в СУТКИ. Поиск —
+  // это один запрос, карточка — ещё один. На такой профиль лимитов хватает.
   //
-  // Данные берутся из api.poiskkino.dev (зеркало kinopoisk.dev). Ключевое
-  // ограничение бесплатного токена — 200 запросов в СУТКИ, поэтому весь
-  // сетевой слой построен вокруг кеша: см. блок «Кеш и квота».
+  // Источников данных два, и они взаимозаменяемы, потому что оба ключуются
+  // одним и тем же id Кинопоиска:
+  //
+  //   kinopoisk.dev (api.poiskkino.dev)  — 200 запросов/сутки, данные богаче
+  //                                        (актёры и похожие приходят вместе с
+  //                                        карточкой, есть imdb и tmdb id)
+  //   kinopoiskapiunofficial.tech        — 500 запросов/сутки
+  //
+  // Если у первого кончился лимит или не принят токен — запрос молча уходит ко
+  // второму. В этом и смысл двух провайдеров: у пользователя со своими ключами
+  // получается 700 бесплатных запросов в сутки вместо 200.
   // ===========================================================================
 
   var SOURCE = 'kp';
-  var API = 'https://api.poiskkino.dev/';
   var DEFAULT_TOKEN = 'WC22CBY-RFA4RS0-Q79XE2S-04DR4DH';
 
   // Lampa меряет время жизни кеша в МИНУТАХ (Request: life * 1000 * 60).
   var HOUR = 60;
   var DAY = 60 * 24;
-
-  // Сколько живёт ответ каждого класса запросов. Каталог обновляется раз в
-  // полсуток — этого достаточно, чтобы лента не «застывала», и мало, чтобы
-  // не сжечь суточную квоту при обычном пользовании.
-  var LIFE = { row: HOUR * 12, list: HOUR * 12, full: DAY * 7, season: DAY * 7, person: DAY * 7, search: HOUR * 2 };
+  var LIFE = { search: HOUR * 6, full: DAY * 7, season: DAY * 7 };
 
   // ===========================================================================
-  // Настройки
+  // Хранилище
   // ===========================================================================
 
   function storageGet(key, def) {
@@ -37,42 +42,405 @@
     if (Lampa.Storage && Lampa.Storage.set) Lampa.Storage.set(key, value);
   }
 
-  function token() {
-    var t = storageGet('kp_token', '');
-    t = (t === null || t === undefined) ? '' : String(t).trim();
-    // Params.field() возвращает строку 'undefined' для незарегистрированных ключей.
-    if (!t || t === 'undefined') return DEFAULT_TOKEN;
-    return t;
-  }
-
-  // Суточный лимит бесплатного токена. Пользователь со своим тарифом поднимает
-  // его в настройках плагина.
-  function quotaLimit() {
-    var n = parseInt(storageGet('kp_quota_limit', 200), 10);
-    return (n > 0) ? n : 200;
+  // Params.field() отдаёт строку 'undefined' для незарегистрированных ключей,
+  // поэтому «пусто» приходится проверять именно так.
+  function cleanString(v) {
+    v = (v === null || v === undefined) ? '' : String(v).trim();
+    return (v === 'undefined') ? '' : v;
   }
 
   // ===========================================================================
-  // Кеш и квота
+  // Общие конструкторы карточки
   //
-  // Два независимых слоя, потому что оба могут отвалиться по отдельности:
+  // Оба провайдера обязаны выдать ОДНУ И ТУ ЖЕ карточку Lampa, поэтому всё, что
+  // ниже по файлу, о различиях между API не знает.
+  // ===========================================================================
+
+  function baseCard(id) {
+    return { source: SOURCE, id: id, kinopoisk_id: id };
+  }
+
+  /**
+   * Разложить названия по полям, от которых зависит роутинг Lampa.
+   * router.add('full'): method = data.original_name ? 'tv' : 'movie'. Поэтому у
+   * фильма только title/original_title, у сериала только name/original_name —
+   * если проставить оба набора, фильм откроется как сериал.
+   */
+  function applyNames(card, series, ru, orig, year) {
+    var date = year ? (year + '-01-01') : '';
+    if (series) {
+      card.name = ru;
+      card.original_name = orig;
+      card.first_air_date = date;
+    } else {
+      card.title = ru;
+      card.original_title = orig;
+      card.release_date = date;
+    }
+    return card;
+  }
+
+  function episode(number, season_number, name, overview, air_date, img_url) {
+    return {
+      id: season_number + '-' + number,
+      episode_number: number,
+      season_number: season_number,
+      name: name || ('Серия ' + number),
+      overview: overview || '',
+      air_date: (air_date || '').slice(0, 10),
+      img: img_url || '',
+      still_path: null, // still_path ушёл бы через хост картинок TMDB
+      vote_average: 0
+    };
+  }
+
+  function season(id, number, name, overview, episodes) {
+    return {
+      id: id,
+      season_number: number,
+      name: name || ('Сезон ' + number),
+      overview: overview || '',
+      episodes: episodes,
+      source: SOURCE
+    };
+  }
+
+  // ===========================================================================
+  // Провайдер 1: kinopoisk.dev
+  // ===========================================================================
+
+  var SERIES_TYPES_DEV = { 'tv-series': 1, 'animated-series': 1, 'tv-show': 1 };
+
+  function devIsSeries(doc) {
+    if (doc.isSeries === true) return true;
+    if (doc.isSeries === false) return false;
+    return !!SERIES_TYPES_DEV[doc.type];
+  }
+
+  function devImage(node, big) {
+    if (!node) return '';
+    return (big ? (node.url || node.previewUrl) : (node.previewUrl || node.url)) || '';
+  }
+
+  function devCard(doc) {
+    if (!doc || doc.id == null) return null;
+    var rating = doc.rating || {}, votes = doc.votes || {};
+    var ru = doc.name || doc.alternativeName || doc.enName || '';
+    var orig = doc.alternativeName || doc.enName || doc.name || '';
+    var year = doc.year || (doc.releaseYears && doc.releaseYears[0] && doc.releaseYears[0].start);
+
+    var card = baseCard(doc.id);
+    card.overview = doc.description || doc.shortDescription || '';
+    // Постеры Кинопоиска — готовые абсолютные URL, поэтому poster_path НЕ
+    // заполняется: Api.img() подставил бы к нему хост TMDB.
+    card.poster = devImage(doc.poster, false);
+    card.img = card.poster;
+    card.background_image = devImage(doc.backdrop, true);
+    card.vote_average = rating.kp || rating.imdb || rating.tmdb || 0;
+    card.vote_count = votes.kp || votes.imdb || 0;
+    card.imdb_rating = rating.imdb || 0;
+    if (doc.externalId && doc.externalId.imdb) card.imdb_id = doc.externalId.imdb;
+    if (doc.ageRating != null) card.pg = doc.ageRating + '+';
+
+    return applyNames(card, devIsSeries(doc), ru, orig, year);
+  }
+
+  function devCards(docs) {
+    var out = [], i, c;
+    docs = docs || [];
+    for (i = 0; i < docs.length; i++) { c = devCard(docs[i]); if (c) out.push(c); }
+    return out;
+  }
+
+  var DEV_PROFESSION_JOB = {
+    director: 'Director', writer: 'Writer', producer: 'Producer',
+    composer: 'Original Music Composer', operator: 'Director of Photography',
+    editor: 'Editor', designer: 'Production Design'
+  };
+
+  function devPersons(persons) {
+    var cast = [], crew = [], i, p, c;
+    persons = persons || [];
+    for (i = 0; i < persons.length; i++) {
+      p = persons[i];
+      if (!p || p.id == null) continue;
+      c = {
+        id: p.id, name: p.name || p.enName || '', original_name: p.enName || p.name || '',
+        img: p.photo || '', poster: p.photo || '', source: SOURCE
+      };
+      if (p.enProfession === 'actor') { c.character = p.description || ''; cast.push(c); }
+      else { c.job = DEV_PROFESSION_JOB[p.enProfession] || p.profession || ''; c.department = p.enProfession || ''; crew.push(c); }
+    }
+    return { id: 0, cast: cast, crew: crew };
+  }
+
+  function devMovie(doc) {
+    var card = devCard(doc);
+    if (!card) return null;
+    var i, genres = doc.genres || [], countries = doc.countries || [];
+
+    card.genres = [];
+    for (i = 0; i < genres.length; i++) card.genres.push({ id: genres[i].id || i, name: genres[i].name });
+    card.production_countries = [];
+    for (i = 0; i < countries.length; i++) card.production_countries.push({ name: countries[i].name });
+    card.origin_country = card.production_countries;
+    card.tagline = doc.slogan || '';
+    card.runtime = doc.movieLength || doc.seriesLength || 0;
+    return card;
+  }
+
+  // Без selectFields Кинопоиск отдаёт документ целиком — на телевизоре это
+  // лишние мегабайты на каждый поиск.
+  var DEV_CARD_FIELDS = ['id', 'name', 'alternativeName', 'enName', 'type', 'isSeries', 'year',
+    'releaseYears', 'description', 'shortDescription', 'rating', 'votes', 'poster',
+    'backdrop', 'genres', 'countries', 'movieLength', 'ageRating', 'externalId'];
+
+  var KPDEV = {
+    name: 'kpdev',
+    title: 'kinopoisk.dev',
+    host: 'https://api.poiskkino.dev/',
+    token_key: 'kp_token',
+    token_default: DEFAULT_TOKEN,
+    limit_key: 'kp_limit_kpdev',
+    limit_default: 200,
+
+    searchPath: function (query, page) {
+      var fields = [], i;
+      for (i = 0; i < DEV_CARD_FIELDS.length; i++) fields.push('selectFields=' + DEV_CARD_FIELDS[i]);
+      return 'v1.4/movie/search?query=' + encodeURIComponent(query) +
+        '&limit=30&page=' + (page || 1) + '&' + fields.join('&');
+    },
+    parseSearch: function (json) {
+      return {
+        results: devCards(json && json.docs),
+        page: (json && json.page) || 1,
+        total_pages: (json && json.pages) || 1,
+        total_results: (json && json.total) || 0
+      };
+    },
+
+    fullPath: function (id) { return 'v1.4/movie/' + id; },
+    parseFull: function (json) {
+      if (!json || json.id == null) throw new Error('empty');
+      return {
+        movie: devMovie(json),
+        persons: devPersons(json.persons),
+        simular: { results: devCards(json.similarMovies), title: 'Похожие' }
+      };
+    },
+
+    seasonsPath: function (id) {
+      return 'v1.4/season?movieId=' + id + '&limit=50&page=1&sortField=number&sortType=1';
+    },
+    parseSeasons: function (json) {
+      var docs = (json && json.docs) || [], out = {}, i, d, eps, j, list;
+      for (i = 0; i < docs.length; i++) {
+        d = docs[i];
+        if (d.number == null) continue;
+        eps = d.episodes || [];
+        list = [];
+        for (j = 0; j < eps.length; j++) {
+          list.push(episode(eps[j].number, d.number, eps[j].name || eps[j].enName,
+            eps[j].description || eps[j].enDescription, eps[j].airDate, devImage(eps[j].still, true)));
+        }
+        out[d.number] = season((d.movieId || 0) + '-' + d.number, d.number, d.name, d.description, list);
+      }
+      return out;
+    }
+  };
+
+  // ===========================================================================
+  // Провайдер 2: kinopoiskapiunofficial.tech
   //
-  //  1. Собственный кеш готовых (уже разобранных) ответов в Lampa.Storage. Он
-  //     не зависит от настройки Lampa «кешировать запросы» и хранит компактные
-  //     карточки, а не сырые ответы Кинопоиска.
-  //  2. Штатный кеш Lampa (params.cache.life). Он бесплатный и, что важнее,
-  //     при ошибке отдаёт устаревшую копию — то есть когда суточная квота
-  //     кончится, лента продолжит открываться.
+  // Пути и имена полей сверены с рабочим клиентом: поиск живёт на v2.1,
+  // карточка и сезоны — на v2.2. Названия полей другие, но id тайтла — тот же
+  // самый id Кинопоиска, поэтому карточку, найденную здесь, можно открыть там.
+  // ===========================================================================
+
+  var SERIES_TYPES_UNOFFICIAL = { 'TV_SERIES': 1, 'MINI_SERIES': 1, 'TV_SHOW': 1 };
+
+  function unofficialIsSeries(doc) {
+    if (doc.serial === true) return true;
+    return !!SERIES_TYPES_UNOFFICIAL[doc.type];
+  }
+
+  // В поиске id называется filmId, в карточке — kinopoiskId.
+  function unofficialId(doc) {
+    var id = (doc.kinopoiskId != null) ? doc.kinopoiskId : doc.filmId;
+    return (id == null) ? null : id;
+  }
+
+  // Жанры приходят как [{genre:'драма'}], страны как [{country:'США'}].
+  // Читаем и через name — на случай, если поле переименуют.
+  function unofficialList(arr, key) {
+    var out = [], i, v;
+    arr = arr || [];
+    for (i = 0; i < arr.length; i++) {
+      v = arr[i] && (arr[i][key] || arr[i].name);
+      if (v) out.push(v);
+    }
+    return out;
+  }
+
+  function unofficialCard(doc) {
+    if (!doc) return null;
+    var id = unofficialId(doc);
+    if (id == null) return null;
+
+    var ru = doc.nameRu || doc.nameEn || doc.nameOriginal || '';
+    var orig = doc.nameOriginal || doc.nameEn || doc.nameRu || '';
+    var year = parseInt(doc.year, 10) || 0;
+
+    var card = baseCard(id);
+    card.overview = doc.description || doc.shortDescription || '';
+    card.poster = doc.posterUrlPreview || doc.posterUrl || '';
+    card.img = card.poster;
+    card.background_image = doc.coverUrl || doc.posterUrl || '';
+    card.vote_average = parseFloat(doc.ratingKinopoisk || doc.rating || doc.ratingImdb) || 0;
+    card.vote_count = parseInt(doc.ratingKinopoiskVoteCount || doc.ratingVoteCount, 10) || 0;
+    card.imdb_rating = parseFloat(doc.ratingImdb) || 0;
+    if (doc.imdbId) card.imdb_id = doc.imdbId;
+
+    return applyNames(card, unofficialIsSeries(doc), ru, orig, year);
+  }
+
+  function unofficialCards(docs) {
+    var out = [], i, c;
+    docs = docs || [];
+    for (i = 0; i < docs.length; i++) { c = unofficialCard(docs[i]); if (c) out.push(c); }
+    return out;
+  }
+
+  var KPU = {
+    name: 'kpu',
+    title: 'kinopoiskapiunofficial.tech',
+    host: 'https://kinopoiskapiunofficial.tech/',
+    token_key: 'kp_token_unofficial',
+    token_default: '',
+    limit_key: 'kp_limit_kpu',
+    limit_default: 500,
+
+    searchPath: function (query, page) {
+      return 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(query) + '&page=' + (page || 1);
+    },
+    parseSearch: function (json) {
+      return {
+        results: unofficialCards(json && json.films),
+        page: 1,
+        total_pages: (json && json.pagesCount) || 1,
+        total_results: (json && json.searchFilmsCountResult) || 0
+      };
+    },
+
+    fullPath: function (id) { return 'api/v2.2/films/' + id; },
+    parseFull: function (json) {
+      var card = unofficialCard(json);
+      if (!card) throw new Error('empty');
+      var genres = unofficialList(json.genres, 'genre');
+      var countries = unofficialList(json.countries, 'country');
+      var i;
+
+      card.genres = [];
+      for (i = 0; i < genres.length; i++) card.genres.push({ id: i, name: genres[i] });
+      card.production_countries = [];
+      for (i = 0; i < countries.length; i++) card.production_countries.push({ name: countries[i] });
+      card.origin_country = card.production_countries;
+      card.tagline = json.slogan || '';
+      card.runtime = parseInt(json.filmLength, 10) || 0;
+
+      // Актёры здесь отдельным запросом (api/v1/staff), а каждый запрос — это
+      // сутки лимита. На вкладке поиска состав не главное, поэтому не тратим:
+      // если нужен состав, карточку откроет kinopoisk.dev, он отдаёт его даром.
+      return { movie: card, persons: { id: 0, cast: [], crew: [] }, simular: { results: [] } };
+    },
+
+    seasonsPath: function (id) { return 'api/v2.2/films/' + id + '/seasons'; },
+    parseSeasons: function (json) {
+      var items = (json && json.items) || [], out = {}, i, s, eps, j, list, num;
+      for (i = 0; i < items.length; i++) {
+        s = items[i];
+        num = (s.number != null) ? s.number : (s.episodes && s.episodes[0] && s.episodes[0].seasonNumber);
+        if (num == null) continue;
+        eps = s.episodes || [];
+        list = [];
+        for (j = 0; j < eps.length; j++) {
+          list.push(episode(eps[j].episodeNumber, num, eps[j].nameRu || eps[j].nameEn,
+            eps[j].synopsis, eps[j].releaseDate, ''));
+        }
+        out[num] = season(num, num, null, null, list);
+      }
+      return out;
+    }
+  };
+
+  // Порядок = приоритет. kinopoisk.dev первым: он отдаёт актёров и похожих
+  // вместе с карточкой, то есть на ту же карточку тратит меньше запросов.
+  var PROVIDERS = [KPDEV, KPU];
+
+  // ===========================================================================
+  // Токены и суточные лимиты — по каждому провайдеру отдельно
+  // ===========================================================================
+
+  function tokenOf(provider) {
+    return cleanString(storageGet(provider.token_key, '')) || provider.token_default;
+  }
+
+  function limitOf(provider) {
+    var n = parseInt(storageGet(provider.limit_key, provider.limit_default), 10);
+    return (n > 0) ? n : provider.limit_default;
+  }
+
+  function todayStamp() {
+    var d = new Date();
+    return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate();
+  }
+
+  function quotaState(provider) {
+    var q = storageGet('kp_quota_' + provider.name, null);
+    if (!q || typeof q !== 'object' || q.day !== todayStamp()) q = { day: todayStamp(), used: 0 };
+    return q;
+  }
+
+  function quotaUsed(provider) { return quotaState(provider).used; }
+
+  function quotaSpend(provider) {
+    var q = quotaState(provider);
+    q.used++;
+    storageSet('kp_quota_' + provider.name, q);
+  }
+
+  function quotaLeft(provider) { return Math.max(0, limitOf(provider) - quotaUsed(provider)); }
+
+  /**
+   * Сервер ответил 403 — суточный лимит кончился. Своему счётчику верить
+   * нельзя: встроенный токен общий на всех, кто поставил плагин, поэтому его
+   * сутки расходуют чужие устройства. Закрываем провайдера до конца суток,
+   * иначе каждый следующий запрос уходит в заведомый отказ.
+   */
+  function quotaExhaust(provider) {
+    storageSet('kp_quota_' + provider.name, { day: todayStamp(), used: limitOf(provider) });
+  }
+
+  /** Провайдеры, которыми сейчас есть смысл ходить: с токеном и с остатком. */
+  function availableProviders() {
+    var out = [], i;
+    for (i = 0; i < PROVIDERS.length; i++) {
+      if (tokenOf(PROVIDERS[i]) && quotaLeft(PROVIDERS[i]) > 0) out.push(PROVIDERS[i]);
+    }
+    return out;
+  }
+
+  // ===========================================================================
+  // Кеш
   //
-  // Квота считается нами самими: заголовки X-RateLimit до колбэка jQuery в
-  // Lampa не доходят, а узнать «сколько осталось» через /v1.5/token стоит
-  // ещё один запрос из тех же двухсот.
+  // Кешируется РАЗОБРАННЫЙ ответ, поэтому ключ не зависит от провайдера: то же
+  // кино, найденное вторым API, ложится в ту же ячейку. В ключе есть вид
+  // запроса (kind) — один путь может читаться по-разному.
   // ===========================================================================
 
   var CACHE_KEY = 'kp_cache';
-  var CACHE_LIMIT = 90; // записей; дальше вытесняем самые старые
-
-  var memory = {}; // кеш на время сессии, чтобы не дёргать Storage на каждый ряд
+  var CACHE_LIMIT = 90;
+  var memory = {};
 
   function cacheRead() {
     var c = storageGet(CACHE_KEY, null);
@@ -81,15 +449,14 @@
 
   function cacheGet(key) {
     if (memory[key] && memory[key].until > Date.now()) return memory[key].data;
-    var all = cacheRead(), hit = all[key];
-    if (!hit) return null;
-    if (hit.until <= Date.now()) return null;
+    var hit = cacheRead()[key];
+    if (!hit || hit.until <= Date.now()) return null;
     memory[key] = hit;
     return hit.data;
   }
 
-  // Устаревшая запись — последний рубеж, когда квота кончилась и сеть отвечает
-  // ошибкой. Лучше показать вчерашнюю ленту, чем пустой экран.
+  // Протухшая запись — последний рубеж, когда лимиты кончились. Вчерашний
+  // результат лучше пустого экрана.
   function cacheGetStale(key) {
     if (memory[key]) return memory[key].data;
     var hit = cacheRead()[key];
@@ -108,7 +475,7 @@
       var drop = keys.length - CACHE_LIMIT, i;
       for (i = 0; i < drop; i++) delete all[keys[i]];
     }
-    try { storageSet(CACHE_KEY, all); } catch (e) { /* переполнение localStorage — просто живём без кеша */ }
+    try { storageSet(CACHE_KEY, all); } catch (e) { /* переполнение localStorage — живём без кеша */ }
   }
 
   function cacheClear() {
@@ -116,55 +483,14 @@
     storageSet(CACHE_KEY, {});
   }
 
-  function todayStamp() {
-    var d = new Date();
-    return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate();
-  }
-
-  // Квота Кинопоиска обнуляется в 21:00 UTC, но нам достаточно посуточного
-  // счётчика: он никогда не занизит остаток, только завысит расход.
-  function quotaState() {
-    var q = storageGet('kp_quota', null);
-    if (!q || typeof q !== 'object' || q.day !== todayStamp()) q = { day: todayStamp(), used: 0 };
-    return q;
-  }
-
-  function quotaUsed() { return quotaState().used; }
-
-  function quotaSpend() {
-    var q = quotaState();
-    q.used++;
-    storageSet('kp_quota', q);
-    return q.used;
-  }
-
-  function quotaLeft() { return Math.max(0, quotaLimit() - quotaUsed()); }
-
-  /**
-   * Сервер сказал, что лимит кончился (403). Наш счётчик может считать иначе:
-   * встроенный токен общий на всех, кто поставил плагин, поэтому его сутки
-   * расходуют чужие устройства. Верим серверу и закрываем сеть до конца суток —
-   * иначе каждый ряд продолжит уходить в заведомый 403.
-   */
-  function quotaExhaust() {
-    storageSet('kp_quota', { day: todayStamp(), used: quotaLimit() });
-  }
-
   // ===========================================================================
-  // Сетевой слой
-  //
-  // Кинопоиск отдаёт 5 запросов в секунду, поэтому очередь с ограничением по
-  // параллельности и минимальным интервалом: без неё ряды главной стреляют
-  // залпом и половина возвращается 429.
+  // Сеть
   // ===========================================================================
 
   var CONCURRENCY = 2;
-  var MIN_GAP = 220; // мс между стартами запросов
+  var MIN_GAP = 220; // мс между стартами: у kinopoisk.dev потолок 5 запросов/сек
 
-  var network = null;
-  var queue = [];
-  var active = 0;
-  var last_start = 0;
+  var network = null, queue = [], active = 0, last_start = 0;
 
   function net() {
     if (!network) {
@@ -181,15 +507,7 @@
     var job = queue.shift();
     active++;
     last_start = Date.now();
-    job(function () {
-      active--;
-      pump();
-    });
-    pump();
-  }
-
-  function enqueue(job) {
-    queue.push(job);
+    job(function () { active--; pump(); });
     pump();
   }
 
@@ -199,527 +517,168 @@
     if (Lampa.Noty && Lampa.Noty.show) Lampa.Noty.show(message);
   }
 
+  /** Один запрос к одному провайдеру. done(parsed) / fail({status}). */
+  function requestOne(provider, path, parse, done, fail) {
+    queue.push(function (release) {
+      quotaSpend(provider);
+      net().silent(provider.host + path, function (json) {
+        release();
+        var data;
+        try { data = parse(json); }
+        catch (e) { fail({ status: 500, parse: true, provider: provider.name }); return; }
+        done(data);
+      }, function (xhr) {
+        release();
+        var status = (xhr && (xhr.status || xhr.decode_code)) || 0;
+        // Кинопоиск различает эти случаи, и путать их нельзя: 401 — токен
+        // неверный, 403 — токен рабочий, но суточный лимит израсходован.
+        if (status === 403) quotaExhaust(provider);
+        fail({ status: status || -1, provider: provider.name });
+      }, false, {
+        dataType: 'json',
+        headers: { 'X-API-KEY': tokenOf(provider) },
+        cache: { life: LIFE.full }
+      });
+    });
+    pump();
+  }
+
+  function warnNoBudget() {
+    var withToken = 0, i;
+    for (i = 0; i < PROVIDERS.length; i++) if (tokenOf(PROVIDERS[i])) withToken++;
+    if (withToken < PROVIDERS.length) {
+      notyOnce('kp_need_token', 'Кинопоиск: суточный лимит исчерпан. Добавьте второй токен в ' +
+        'Настройки → Кинопоиск — это ещё 500 запросов в сутки (kinopoiskapiunofficial.tech).');
+    } else {
+      notyOnce('kp_no_budget', 'Кинопоиск: суточный лимит исчерпан по всем токенам. Показаны сохранённые данные.');
+    }
+  }
+
   /**
-   * Запрос к API Кинопоиска.
+   * Запрос с переключением между провайдерами.
    *
-   * В кеш кладётся РАЗОБРАННЫЙ ответ, а не сырой JSON, поэтому ключ обязан
-   * различать два прочтения одного пути (например список сезонов как карта и
-   * как страница). За это отвечает kind — без него первый вызов отдал бы
-   * второму чужую структуру.
-   *
-   * @param {string} kind   тег вызывающего: 'row' | 'full' | 'season' | ...
-   * @param {string} path   путь с query, например 'v1.4/movie?type=movie&page=1'
+   * @param {string} kind   вид запроса — часть ключа кеша
+   * @param {string} key    ключ кеша, одинаковый для обоих провайдеров
    * @param {number} life   время жизни кеша в минутах
-   * @param {function} parse сырой JSON → то, что кладём в кеш и отдаём наружу
-   * @param {function} done принимает УЖЕ разобранный результат
-   * @param {function} fail
+   * @param {function} build  (provider) -> {path, parse}
    */
-  function get(kind, path, life, parse, done, fail) {
-    var key = kind + '|' + path;
-    var cached = cacheGet(key);
+  function get(kind, key, life, build, done, fail) {
+    var cache_key = kind + '|' + key;
+    var cached = cacheGet(cache_key);
     if (cached !== null) { done(cached); return; }
 
-    // Квота кончилась — отдаём протухшее вместо ошибки. Пустой экран здесь
-    // хуже вчерашних данных.
-    if (quotaLeft() <= 0) {
-      var stale = cacheGetStale(key);
-      notyOnce('kp_quota_noted', 'Кинопоиск: суточный лимит запросов исчерпан (' + quotaLimit() + '). ' +
-        'Вставьте свой токен в Настройки → Кинопоиск (бот @poiskkinodev_bot). Показаны сохранённые данные.');
+    var list = availableProviders();
+    if (!list.length) {
+      var stale = cacheGetStale(cache_key);
+      warnNoBudget();
       if (stale !== null) done(stale);
       else fail({ status: 429, quota: true });
       return;
     }
 
-    enqueue(function (release) {
-      quotaSpend();
-      net().silent(API + path, function (json) {
-        release();
-        var data;
-        try { data = parse(json); }
-        catch (e) { fail({ status: 500, parse: true }); return; }
-        cacheSet(key, data, life);
-        done(data);
-      }, function (xhr) {
-        release();
-        var status = (xhr && (xhr.status || xhr.decode_code)) || 0;
-        // Кинопоиск различает эти два случая, и путать их нельзя: 401 — токен
-        // неверный, 403 — токен верный, но суточный лимит уже израсходован.
-        // Одно сообщение на оба заставляло бы менять исправный токен.
-        if (status === 403) {
-          quotaExhaust();
-          notyOnce('kp_quota_noted', 'Кинопоиск: суточный лимит запросов исчерпан. ' +
-            'Вставьте свой токен в Настройки → Кинопоиск (бот @poiskkinodev_bot). Пока показаны сохранённые данные.');
-        } else if (status === 401) {
-          notyOnce('kp_auth_noted', 'Кинопоиск: токен некорректен. Проверьте его в Настройки → Кинопоиск.');
-        }
-        var old = cacheGetStale(key);
+    var i = 0, last = null;
+    function attempt() {
+      if (i >= list.length) {
+        var old = cacheGetStale(cache_key);
         if (old !== null) done(old);
-        else fail({ status: status || -1 });
-      }, false, {
-        dataType: 'json',
-        headers: { 'X-API-KEY': token() },
-        cache: { life: life }
+        else fail(last || { status: -1 });
+        return;
+      }
+      var provider = list[i++];
+      var spec = build(provider);
+      requestOne(provider, spec.path, spec.parse, function (data) {
+        cacheSet(cache_key, data, life);
+        done(data);
+      }, function (err) {
+        last = err;
+        if (err.status === 401) {
+          notyOnce('kp_auth_' + provider.name,
+            'Кинопоиск: токен ' + provider.title + ' некорректен. Проверьте его в Настройки → Кинопоиск.');
+        }
+        attempt(); // 403, 401, сеть — в любом случае пробуем следующего
       });
+    }
+    attempt();
+  }
+
+  // ===========================================================================
+  // Источник: поиск
+  // ===========================================================================
+
+  function searchQuery(params) {
+    var query = (params && params.query) || '';
+    // Из общего поиска запрос приходит закодированным, из своего — сырым.
+    try { query = decodeURIComponent(query); } catch (e) { /* сырая строка с % */ }
+    return query.trim();
+  }
+
+  function searchPage(query, page, done, fail) {
+    get('search', query.toLowerCase() + '|' + page, LIFE.search, function (provider) {
+      return { path: provider.searchPath(query, page), parse: provider.parseSearch };
+    }, done, fail);
+  }
+
+  function search(params, oncomplite, onerror) {
+    var query = searchQuery(params);
+    if (!query) { oncomplite([]); return; }
+
+    searchPage(query, 1, function (page) {
+      var movies = [], series = [], rows = [], i;
+      for (i = 0; i < page.results.length; i++) {
+        if (page.results[i].original_name) series.push(page.results[i]);
+        else movies.push(page.results[i]);
+      }
+      if (movies.length) rows.push({ title: 'Фильмы', type: 'movie', results: movies, source: SOURCE, url: '' });
+      if (series.length) rows.push({ title: 'Сериалы', type: 'tv', results: series, source: SOURCE, url: '' });
+      oncomplite(rows);
+    }, function () {
+      if (onerror) onerror(); else oncomplite([]);
     });
   }
 
-  // ===========================================================================
-  // Кинопоиск → карточка Lampa
-  //
-  // Lampa отличает фильм от сериала по наличию original_name (router 'full':
-  // method = data.original_name ? 'tv' : 'movie'). Поэтому у фильма ТОЛЬКО
-  // title/original_title, у сериала ТОЛЬКО name/original_name — смешивать
-  // нельзя, иначе фильм откроется как сериал.
-  //
-  // Постеры Кинопоиска — готовые URL, а Api.img() всегда подставляет хост
-  // TMDB. Отсюда правило: poster_path НЕ заполняем, кладём poster/img/
-  // background_image, которые Lampa берёт как есть.
-  // ===========================================================================
-
-  var SERIES_TYPES = { 'tv-series': 1, 'animated-series': 1, 'tv-show': 1 };
-
-  function isSeries(doc) {
-    if (doc.isSeries === true) return true;
-    if (doc.isSeries === false) return false;
-    return !!SERIES_TYPES[doc.type];
-  }
-
-  function pickImage(node, prefer_big) {
-    if (!node) return '';
-    return (prefer_big ? (node.url || node.previewUrl) : (node.previewUrl || node.url)) || '';
-  }
-
-  function yearDate(doc) {
-    var y = doc.year || (doc.releaseYears && doc.releaseYears[0] && doc.releaseYears[0].start);
-    return y ? (y + '-01-01') : '';
-  }
-
-  // Единственный рейтинг, который Lampa рисует на карточке — vote_average.
-  // Кинопоиск для русской аудитории роднее IMDB, поэтому он и идёт в основной.
-  // На полной карточке Lampa переименовывает первый бейдж в имя источника
-  // («KP» вместо «TMDB»), так что отдельный kp_rating дал бы ту же оценку
-  // вторым бейджем — поэтому его здесь нет, только imdb_rating рядом.
-  function ratingOf(doc) {
-    var r = doc.rating || {};
-    return r.kp || r.imdb || r.tmdb || 0;
-  }
-
-  function namesOf(doc) {
-    var ru = doc.name || doc.alternativeName || doc.enName || '';
-    var orig = doc.alternativeName || doc.enName || doc.name || '';
-    return { ru: ru, orig: orig };
-  }
-
-  /**
-   * Карточка для рядов и сеток. Плоская и маленькая — она уходит в кеш и в
-   * избранное (Lampa хранит только поля из своего card_fields).
-   */
-  function toCard(doc) {
-    if (!doc || doc.id == null) return null;
-    var n = namesOf(doc);
-    var series = isSeries(doc);
-    var votes = doc.votes || {};
-    var rating = doc.rating || {};
-
-    var card = {
-      source: SOURCE,
-      id: doc.id,
-      kinopoisk_id: doc.id,
-      overview: doc.description || doc.shortDescription || '',
-      poster: pickImage(doc.poster, false),
-      img: pickImage(doc.poster, false),
-      background_image: pickImage(doc.backdrop, true),
-      vote_average: ratingOf(doc),
-      vote_count: votes.kp || votes.imdb || 0,
-      imdb_rating: rating.imdb || 0,
-      kp_type: doc.type || (series ? 'tv-series' : 'movie')
-    };
-
-    if (series) {
-      card.name = n.ru;
-      card.original_name = n.orig;
-      card.first_air_date = yearDate(doc);
-    } else {
-      card.title = n.ru;
-      card.original_title = n.orig;
-      card.release_date = yearDate(doc);
-    }
-
-    if (doc.externalId && doc.externalId.imdb) card.imdb_id = doc.externalId.imdb;
-    if (doc.ageRating != null) card.pg = doc.ageRating + '+';
-
-    return card;
-  }
-
-  function toCards(docs) {
-    var out = [], i, c;
-    docs = docs || [];
-    for (i = 0; i < docs.length; i++) { c = toCard(docs[i]); if (c) out.push(c); }
-    return out;
-  }
-
-  /** Ответ-список Кинопоиска → страница результатов в формате Lampa. */
-  function toPage(json, url) {
+  /** Вкладка «Кинопоиск» в общем поиске Lampa. */
+  function discovery() {
     return {
-      results: toCards(json && json.docs),
-      page: (json && json.page) || 1,
-      total_pages: (json && json.pages) || 1,
-      total_results: (json && json.total) || 0,
-      url: url,
-      source: SOURCE
-    };
-  }
-
-  // ===========================================================================
-  // Запросы каталога
-  // ===========================================================================
-
-  // Поля, которых хватает карточке. Без selectFields Кинопоиск отдаёт документ
-  // целиком (со всеми names, facts, watchability) — на 250 карточках это
-  // мегабайты трафика на телевизоре.
-  var CARD_FIELDS = ['id', 'name', 'alternativeName', 'enName', 'type', 'isSeries', 'year',
-    'releaseYears', 'description', 'shortDescription', 'rating', 'votes', 'poster',
-    'backdrop', 'genres', 'countries', 'movieLength', 'seriesLength', 'ageRating',
-    'ratingMpaa', 'externalId', 'top250'];
-
-  function fieldsQuery(fields) {
-    var out = [], i;
-    for (i = 0; i < fields.length; i++) out.push('selectFields=' + fields[i]);
-    return out.join('&');
-  }
-
-  /** Путь ряда/сетки: url ряда + постраничность + служебные поля. */
-  function listPath(url, page, limit) {
-    var q = url;
-    if (q.indexOf('notNullFields=') < 0) q += '&notNullFields=name&notNullFields=poster.url';
-    q += '&' + fieldsQuery(CARD_FIELDS);
-    q += '&limit=' + (limit || 30) + '&page=' + (page || 1);
-    return 'v1.4/movie?' + q;
-  }
-
-  function fetchList(url, page, life, done, fail) {
-    get('row', listPath(url, page), life, function (json) { return toPage(json, url); }, done, fail);
-  }
-
-  // ===========================================================================
-  // Ряды главной страницы
-  //
-  // Каждый ряд — один запрос, поэтому их порядок = порядок трат квоты. Lampa
-  // грузит ленту порциями (partNext), так что первое открытие стоит ~6
-  // запросов, остальное подтягивается по мере прокрутки и попадает в кеш.
-  // ===========================================================================
-
-  function ddmmyyyy(d) {
-    function p(n) { return (n < 10 ? '0' : '') + n; }
-    return p(d.getDate()) + '.' + p(d.getMonth() + 1) + '.' + d.getFullYear();
-  }
-
-  var POPULAR = 'sortField=votes.kp&sortType=-1';
-  var FRESH = 'sortField=year&sortType=-1';
-
-  // notNullFields на постер уже добавляет listPath; здесь только смысловые фильтры.
-  function catalogRows(now) {
-    now = now || new Date();
-    var year = now.getFullYear();
-    var since = new Date(now.getTime() - 60 * 24 * 3600 * 1000);
-    var until = new Date(now.getTime() + 30 * 24 * 3600 * 1000);
-
-    return [
-      { title: 'Сейчас в кино',
-        url: 'type=movie&premiere.russia=' + ddmmyyyy(since) + '-' + ddmmyyyy(until) + '&sortField=premiere.russia&sortType=-1' },
-      { title: 'Популярные фильмы',
-        url: 'type=movie&rating.kp=6-10&votes.kp=5000-10000000&' + POPULAR },
-      { title: 'Популярные сериалы',
-        url: 'type=tv-series&rating.kp=6-10&votes.kp=2000-10000000&' + POPULAR },
-      { title: 'Новинки кино',
-        url: 'type=movie&year=' + (year - 1) + '-' + year + '&votes.kp=500-10000000&' + FRESH },
-      { title: 'Новые сериалы',
-        url: 'type=tv-series&year=' + (year - 1) + '-' + year + '&votes.kp=200-10000000&' + FRESH },
-      { title: 'Топ 250 Кинопоиска',
-        url: 'lists=top250&sortField=top250&sortType=1' },
-      { title: 'Лучшее по версии зрителей',
-        url: 'rating.kp=8-10&votes.kp=100000-10000000&sortField=rating.kp&sortType=-1' },
-      { title: 'Российские сериалы',
-        url: 'type=tv-series&countries.name=Россия&votes.kp=1000-10000000&' + POPULAR },
-      { title: 'Аниме',
-        url: 'type=anime&votes.kp=500-10000000&' + POPULAR },
-      { title: 'Мультфильмы',
-        url: 'type=cartoon&votes.kp=2000-10000000&' + POPULAR }
-    ];
-  }
-
-  // Жанры Кинопоиска фильтруются по русскому имени, а не по id.
-  var GENRE_ROWS = [
-    { title: 'Боевики', genre: 'боевик' },
-    { title: 'Комедии', genre: 'комедия' },
-    { title: 'Драмы', genre: 'драма' },
-    { title: 'Триллеры', genre: 'триллер' },
-    { title: 'Фантастика', genre: 'фантастика' },
-    { title: 'Ужасы', genre: 'ужасы' },
-    { title: 'Детективы', genre: 'детектив' },
-    { title: 'Мелодрамы', genre: 'мелодрама' },
-    { title: 'Криминал', genre: 'криминал' },
-    { title: 'Приключения', genre: 'приключения' },
-    { title: 'Фэнтези', genre: 'фэнтези' },
-    { title: 'Военные', genre: 'военный' }
-  ];
-
-  function genreRows() {
-    var out = [], i, g;
-    for (i = 0; i < GENRE_ROWS.length; i++) {
-      g = GENRE_ROWS[i];
-      out.push({
-        title: g.title,
-        url: 'genres.name=' + encodeURIComponent(g.genre) + '&rating.kp=5-10&votes.kp=1000-10000000&' + POPULAR
-      });
-    }
-    return out;
-  }
-
-  function allRows(now) {
-    return catalogRows(now).concat(genreRows());
-  }
-
-  // ===========================================================================
-  // Источник: главная лента
-  // ===========================================================================
-
-  function rowLoader(row) {
-    return function (call) {
-      fetchList(row.url, 1, LIFE.row, function (page) {
-        page.title = row.title;
-        call(page.results.length ? page : {});
-      }, function () { call({}); });
-    };
-  }
-
-  function main(params, oncomplite, onerror) {
-    params = params || {};
-    var parts_limit = 5; // порций на экран; остальное — по прокрутке
-    var parts = [], rows = allRows(), i;
-    for (i = 0; i < rows.length; i++) parts.push(rowLoader(rows[i]));
-
-    function loadPart(partLoaded, partEmpty) {
-      Lampa.Api.partNext(parts, parts_limit, partLoaded, partEmpty);
-    }
-
-    loadPart(oncomplite, onerror);
-    return loadPart;
-  }
-
-  // ===========================================================================
-  // Источник: сетка «ещё» и категории
-  // ===========================================================================
-
-  function list(params, oncomplite, onerror) {
-    params = params || {};
-    var url = params.url || ('type=movie&' + POPULAR);
-    fetchList(url, params.page || 1, LIFE.list, oncomplite, onerror || function () {});
-  }
-
-  // Пункты «Фильмы» / «Сериалы» из меню Lampa приходят сюда с url 'movie'|'tv'.
-  function category(params, oncomplite, onerror) {
-    params = params || {};
-    var tv = params.url === 'tv';
-    var base = tv ? 'type=tv-series' : 'type=movie';
-    var parts = [
-      { title: tv ? 'Популярные сериалы' : 'Популярные фильмы', url: base + '&rating.kp=6-10&votes.kp=2000-10000000&' + POPULAR },
-      { title: 'Новинки', url: base + '&year=' + ((new Date()).getFullYear() - 1) + '-' + (new Date()).getFullYear() + '&votes.kp=200-10000000&' + FRESH },
-      { title: 'Высокий рейтинг', url: base + '&rating.kp=8-10&votes.kp=50000-10000000&sortField=rating.kp&sortType=-1' }
-    ];
-    var loaders = [], i;
-    for (i = 0; i < parts.length; i++) loaders.push(rowLoader(parts[i]));
-    var genres = genreRows();
-    for (i = 0; i < genres.length; i++) {
-      loaders.push(rowLoader({ title: genres[i].title, url: genres[i].url + '&' + base }));
-    }
-
-    function loadPart(partLoaded, partEmpty) {
-      Lampa.Api.partNext(loaders, 5, partLoaded, partEmpty);
-    }
-    loadPart(oncomplite, onerror);
-    return loadPart;
-  }
-
-  // ===========================================================================
-  // Источник: полная карточка
-  //
-  // Кинопоиск отдаёт всё одним документом (персоны, похожие, сиквелы), так что
-  // карточка фильма — ОДИН запрос вместо пяти у TMDB. Для сериала добавляется
-  // второй за списком сезонов.
-  // ===========================================================================
-
-  var PROFESSION_JOB = {
-    director: 'Director',
-    writer: 'Writer',
-    producer: 'Producer',
-    composer: 'Original Music Composer',
-    operator: 'Director of Photography',
-    editor: 'Editor',
-    designer: 'Production Design'
-  };
-
-  function personCard(p) {
-    return {
-      id: p.id,
-      name: p.name || p.enName || '',
-      original_name: p.enName || p.name || '',
-      img: p.photo || '',
-      poster: p.photo || '',
-      source: SOURCE
-    };
-  }
-
-  function splitPersons(persons) {
-    var cast = [], crew = [], i, p, c;
-    persons = persons || [];
-    for (i = 0; i < persons.length; i++) {
-      p = persons[i];
-      if (!p || p.id == null) continue;
-      c = personCard(p);
-      if (p.enProfession === 'actor') {
-        c.character = p.description || '';
-        cast.push(c);
-      } else {
-        c.job = PROFESSION_JOB[p.enProfession] || p.profession || p.enProfession || '';
-        c.department = p.enProfession || '';
-        crew.push(c);
-      }
-    }
-    return { id: 0, cast: cast, crew: crew };
-  }
-
-  /** Полный документ Кинопоиска → объект movie в формате Lampa. */
-  function toMovie(doc) {
-    var card = toCard(doc);
-    var series = isSeries(doc);
-    var genres = doc.genres || [], countries = doc.countries || [];
-    var i, out;
-
-    out = card;
-    out.genres = [];
-    for (i = 0; i < genres.length; i++) out.genres.push({ id: genres[i].id || i, name: genres[i].name, url: 'genres.name=' + encodeURIComponent(genres[i].name) + '&' + POPULAR });
-
-    out.production_companies = [];
-    if (doc.networks && doc.networks.items) {
-      for (i = 0; i < doc.networks.items.length; i++) out.production_companies.push({ id: i, name: doc.networks.items[i].name });
-    }
-
-    out.production_countries = [];
-    for (i = 0; i < countries.length; i++) out.production_countries.push({ name: countries[i].name });
-    out.origin_country = out.production_countries;
-
-    out.tagline = doc.slogan || '';
-    out.status = doc.status || '';
-    out.runtime = doc.movieLength || doc.seriesLength || 0;
-
-    // seasonsInfo в ответе /movie/{id} обычно нет — настоящие сезоны приходят
-    // из /v1.4/season (см. applySeasons). Здесь лишь то, что дал документ,
-    // чтобы карточка не была пустой, если запрос сезонов не удался.
-    if (series) {
-      var info = doc.seasonsInfo || [];
-      out.number_of_seasons = info.length;
-      out.number_of_episodes = 0;
-      out.seasons = [];
-      for (i = 0; i < info.length; i++) {
-        out.number_of_episodes += (info[i].episodesCount || 0);
-        out.seasons.push({
-          id: doc.id + '-' + info[i].number,
-          season_number: info[i].number,
-          episode_count: info[i].episodesCount || 0,
-          name: 'Сезон ' + info[i].number
+      title: 'Кинопоиск',
+      search: search,
+      params: { align_left: true, object: { source: SOURCE } },
+      onMore: function (params, close) {
+        close();
+        Lampa.Activity.push({
+          url: '',
+          title: 'Кинопоиск — ' + params.query,
+          component: 'category_full',
+          source: SOURCE,
+          query: encodeURIComponent(params.query),
+          page: 1
         });
-      }
-    }
-
-    // Рейтинги в шапке: Lampa рисует vote_average, а kp_rating/imdb_rating
-    // подхватывают плагины рейтингов.
-    out.source = SOURCE;
-    return out;
+      },
+      onCancel: function () { net().clear(); }
+    };
   }
 
-  function full(params, oncomplite, onerror) {
-    params = params || {};
-    var id = params.id || (params.card && params.card.id);
-    if (!id) { if (onerror) onerror(); return; }
-
-    get('full', 'v1.4/movie/' + id, LIFE.full, function (json) {
-      if (!json || json.id == null) throw new Error('empty');
-      var movie = toMovie(json);
-      var data = {
-        movie: movie,
-        persons: splitPersons(json.persons),
-        simular: { results: toCards(json.similarMovies), title: 'Похожие' },
-        recomend: { results: toCards(json.sequelsAndPrequels), title: 'Сиквелы и приквелы' },
-        source: SOURCE,
-        // seasonsInfo нужен seasons() ниже, чтобы не ходить в сеть повторно
-        kp_seasons: json.seasonsInfo || []
-      };
-      return data;
-    }, function (data) {
-      // /v1.4/movie/{id} НЕ отдаёт seasonsInfo (проверено на реальном ответе),
-      // поэтому сезоны сериала всегда берём из /v1.4/season — он и есть
-      // источник правды. Запрос тот же, что потом сделает экран серий, так
-      // что кеш переиспользуется и второй раз квоту не тратит.
-      if (!data.movie.original_name) { oncomplite(data); return; }
-      loadSeasonMap(id, function (map) {
-        applySeasons(data.movie, map);
-        var last = lastSeason(map);
-        if (last) data.episodes = last;
-        oncomplite(data);
+  /** Сетка «ещё» из вкладки поиска — тот же поиск, постранично. */
+  function list(params, oncomplite, onerror) {
+    var query = searchQuery(params);
+    if (!query) { oncomplite({ results: [], page: 1, total_pages: 1 }); return; }
+    searchPage(query, params.page || 1, function (page) {
+      oncomplite({
+        results: page.results,
+        page: page.page,
+        total_pages: page.total_pages,
+        total_results: page.total_results,
+        source: SOURCE
       });
     }, onerror || function () {});
   }
 
   // ===========================================================================
-  // Источник: сезоны и серии
+  // Источник: карточка, сезоны и серии
   // ===========================================================================
 
-  function toEpisode(ep, season_number) {
-    return {
-      id: ep.id || (season_number + '-' + ep.number),
-      episode_number: ep.number,
-      season_number: season_number,
-      name: ep.name || ep.enName || ('Серия ' + ep.number),
-      overview: ep.description || ep.enDescription || '',
-      air_date: (ep.airDate || '').slice(0, 10),
-      img: pickImage(ep.still, true),
-      still_path: null,
-      vote_average: 0
-    };
-  }
-
-  function toSeason(doc) {
-    var eps = doc.episodes || [], out = [], i;
-    for (i = 0; i < eps.length; i++) out.push(toEpisode(eps[i], doc.number));
-    return {
-      id: doc.movieId + '-' + doc.number,
-      season_number: doc.number,
-      name: doc.name || ('Сезон ' + doc.number),
-      overview: doc.description || '',
-      episodes: out,
-      source: SOURCE
-    };
-  }
-
-  // Один и тот же путь для карточки и для экрана серий — тогда открытие
-  // сезонов уже лежит в кеше и не стоит ни одного запроса.
-  var SEASON_LIMIT = 50;
-
-  function seasonPath(movie_id) {
-    return 'v1.4/season?movieId=' + movie_id + '&limit=' + SEASON_LIMIT + '&page=1&sortField=number&sortType=1';
-  }
-
-  /** Все сезоны сериала одним запросом: { <номер сезона>: сезон }. */
-  function loadSeasonMap(movie_id, done) {
-    get('season', seasonPath(movie_id), LIFE.season, function (json) {
-      var docs = (json && json.docs) || [], out = {}, i, s;
-      for (i = 0; i < docs.length; i++) {
-        s = toSeason(docs[i]);
-        if (s.season_number == null) continue;
-        out[s.season_number] = s;
-      }
-      return out;
+  function loadSeasonMap(id, done) {
+    get('season', '' + id, LIFE.season, function (provider) {
+      return { path: provider.seasonsPath(id), parse: provider.parseSeasons };
     }, done, function () { done({}); });
   }
 
@@ -737,187 +696,78 @@
     return keys.length ? map[keys[keys.length - 1]] : null;
   }
 
-  /**
-   * Проставить сериалу счётчики сезонов и серий по реальным документам.
-   * Пустая карта ничего не трогает — остаётся то, что дал сам документ фильма.
-   */
+  /** Счётчики сезонов и серий — по реальным документам, а не по обещаниям. */
   function applySeasons(movie, map) {
-    var keys = seasonNumbers(map), i, n, season, list = [], seasons_count = 0, episodes_count = 0;
+    var keys = seasonNumbers(map), i, n, s, list = [], seasons_count = 0, episodes_count = 0;
     if (!keys.length) return movie;
-
     for (i = 0; i < keys.length; i++) {
       n = keys[i];
-      season = map[n];
-      if (n > 0) seasons_count++;
-      episodes_count += season.episodes.length;
+      s = map[n];
+      if (n > 0) seasons_count++; // нулевой сезон — спецвыпуски, это не сезон
+      episodes_count += s.episodes.length;
       list.push({
-        id: season.id,
-        season_number: n,
-        episode_count: season.episodes.length,
-        name: season.name,
-        overview: season.overview,
-        air_date: (season.episodes[0] && season.episodes[0].air_date) || ''
+        id: s.id, season_number: n, episode_count: s.episodes.length,
+        name: s.name, overview: s.overview,
+        air_date: (s.episodes[0] && s.episodes[0].air_date) || ''
       });
     }
-
     movie.number_of_seasons = seasons_count || keys.length;
     movie.number_of_episodes = episodes_count;
     movie.seasons = list;
     return movie;
   }
 
+  function full(params, oncomplite, onerror) {
+    params = params || {};
+    var id = params.id || (params.card && params.card.id);
+    if (!id) { if (onerror) onerror(); return; }
+
+    get('full', '' + id, LIFE.full, function (provider) {
+      return { path: provider.fullPath(id), parse: provider.parseFull };
+    }, function (data) {
+      var out = { movie: data.movie, persons: data.persons, simular: data.simular, source: SOURCE };
+      if (!out.movie.original_name) { oncomplite(out); return; }
+
+      // Ни один из двух API не отдаёт сезоны вместе с карточкой, так что для
+      // сериала это всегда второй запрос — зато ровно тот же, что потом
+      // сделает экран серий, и там он уже будет в кеше.
+      loadSeasonMap(id, function (map) {
+        applySeasons(out.movie, map);
+        var last = lastSeason(map);
+        if (last) out.episodes = last;
+        oncomplite(out);
+      });
+    }, onerror || function () {});
+  }
+
   /** Контракт Lampa: seasons(card, [номера сезонов], oncomplite). */
   function seasons(card, from, oncomplite) {
     loadSeasonMap(card.id, function (map) {
       var res = {}, i;
-      for (i = 0; i < from.length; i++) {
-        if (map[from[i]]) res['' + from[i]] = map[from[i]];
-      }
+      for (i = 0; i < from.length; i++) if (map[from[i]]) res['' + from[i]] = map[from[i]];
       oncomplite(res);
     });
   }
 
   // ===========================================================================
-  // Источник: поиск
+  // Остальное по контракту источника
+  //
+  // Каталога у плагина нет, но Lampa может позвать любой метод источника —
+  // например если Кинопоиск когда-то был выбран основным. Честный пустой ответ
+  // лучше исключения внутри чужого компонента.
   // ===========================================================================
 
-  function searchPath(query, page) {
-    return 'v1.4/movie/search?query=' + encodeURIComponent(query) + '&limit=30&page=' + (page || 1);
+  function emptyMain(params, oncomplite, onerror) {
+    if (onerror) onerror();
+    return function (resolve, reject) { if (reject) reject(); };
   }
-
-  function search(params, oncomplite, onerror) {
-    params = params || {};
-    var query = params.query || '';
-    // Из общего поиска запрос приходит закодированным, из своего — сырым.
-    try { query = decodeURIComponent(query); } catch (e) { /* сырая строка с % */ }
-    if (!query) { oncomplite([]); return; }
-
-    get('search', searchPath(query, params.page || 1), LIFE.search, function (json) {
-      return toCards(json && json.docs);
-    }, function (cards) {
-      var movies = [], series = [], i;
-      for (i = 0; i < cards.length; i++) {
-        if (cards[i].original_name) series.push(cards[i]);
-        else movies.push(cards[i]);
-      }
-      var rows = [];
-      if (movies.length) rows.push({ title: 'Фильмы', type: 'movie', results: movies, source: SOURCE, url: '' });
-      if (series.length) rows.push({ title: 'Сериалы', type: 'tv', results: series, source: SOURCE, url: '' });
-      oncomplite(rows);
-    }, function () {
-      if (onerror) onerror(); else oncomplite([]);
-    });
-  }
-
-  // Вкладка «Кинопоиск» в общем поиске Lampa.
-  function discovery() {
-    return {
-      title: 'Кинопоиск',
-      search: search,
-      params: { align_left: true, object: { source: SOURCE } },
-      onMore: function (params, close) {
-        close();
-        Lampa.Activity.push({
-          url: '',
-          title: 'Поиск — ' + params.query,
-          component: 'category_full',
-          source: SOURCE,
-          query: encodeURIComponent(params.query),
-          page: 1
-        });
-      },
-      onCancel: function () { net().clear(); }
-    };
-  }
-
-  // ===========================================================================
-  // Источник: страница актёра
-  // ===========================================================================
-
-  function personCredits(doc) {
-    var movies = doc.movies || [], cast = [], crew = [], i, m, card;
-    for (i = 0; i < movies.length; i++) {
-      m = movies[i];
-      if (!m || m.id == null) continue;
-      card = {
-        source: SOURCE,
-        id: m.id,
-        kinopoisk_id: m.id,
-        vote_average: m.rating || 0,
-        vote_count: 0,
-        year: 0,
-        media_type: 'movie'
-      };
-      // У /person нет типа тайтла, поэтому все работы идут как фильмы: иначе
-      // половина карточек открывалась бы неправильным методом.
-      card.title = m.name || m.alternativeName || '';
-      card.original_title = m.alternativeName || m.name || '';
-      card.release_date = '';
-      if (m.enProfession === 'actor') { card.character = m.description || ''; cast.push(card); }
-      else { card.job = PROFESSION_JOB[m.enProfession] || m.enProfession || ''; card.department = m.enProfession || 'acting'; crew.push(card); }
-    }
-    return { cast: cast, crew: crew };
-  }
-
-  function person(params, oncomplite, onerror) {
-    params = params || {};
-    get('person', 'v1.4/person/' + params.id, LIFE.person, function (json) {
-      if (!json || json.id == null) throw new Error('empty');
-      var credits = personCredits(json);
-      var p = {
-        id: json.id,
-        name: json.name || json.enName || '',
-        original_name: json.enName || json.name || '',
-        birthday: (json.birthday || '').slice(0, 10),
-        deathday: (json.death || '').slice(0, 10),
-        place_of_birth: (json.birthPlace && json.birthPlace[0] && json.birthPlace[0].value) || '',
-        biography: (json.facts && json.facts[0] && json.facts[0].value) || '',
-        known_for_department: json.enProfession || 'acting',
-        img: json.photo || '',
-        poster: json.photo || '',
-        source: SOURCE
-      };
-      var movies = credits.cast.concat(credits.crew);
-      return {
-        person: p,
-        credits: {
-          raw: credits,
-          cast: credits.cast,
-          crew: credits.crew,
-          movie: credits.cast,
-          tv: [],
-          knownFor: movies.length ? [{ name: 'Фильмы', credits: movies.slice(0, 40), vote_count: 0 }] : []
-        }
-      };
-    }, oncomplite, onerror || function () {});
-  }
-
-  // ===========================================================================
-  // Источник: остальное по контракту Lampa
-  // ===========================================================================
-
-  function menu(params, oncomplite) {
-    var out = [], i;
-    for (i = 0; i < GENRE_ROWS.length; i++) out.push({ title: GENRE_ROWS[i].title, id: GENRE_ROWS[i].genre });
-    oncomplite(out);
-  }
-
-  function menuCategory(params, oncomplite) {
-    var tv = params && params.action === 'tv';
-    var base = tv ? 'type=tv-series' : 'type=movie';
-    oncomplite([
-      { title: 'Популярное', url: base + '&rating.kp=6-10&votes.kp=2000-10000000&' + POPULAR, source: SOURCE },
-      { title: 'Новинки', url: base + '&year=' + ((new Date()).getFullYear() - 1) + '-' + (new Date()).getFullYear() + '&' + FRESH, source: SOURCE },
-      { title: 'Высокий рейтинг', url: base + '&rating.kp=8-10&votes.kp=50000-10000000&sortField=rating.kp&sortType=-1', source: SOURCE }
-    ]);
-  }
-
-  function company(params, oncomplite, onerror) { if (onerror) onerror(); }
-  function favorite(params, oncomplite, onerror) { if (onerror) onerror(); }
+  function emptyCategory(params, oncomplite, onerror) { if (onerror) onerror(); }
+  function emptyMenu(params, oncomplite) { if (oncomplite) oncomplite([]); }
+  function person(params, oncomplite, onerror) { if (onerror) onerror(); }
   function clear() { net().clear(); }
 
-  // Кинопоиск отдаёт абсолютные URL картинок, но Lampa местами всё равно зовёт
-  // Api.img(); пропускаем такой путь насквозь, чтобы не получить битую ссылку.
+  // Картинки Кинопоиска — готовые абсолютные URL. Api.img() всегда подставляет
+  // хост TMDB, поэтому такой путь пропускаем насквозь.
   function img(src, size) {
     if (!src) return '';
     if (/^https?:\/\//i.test(src)) return src;
@@ -926,32 +776,33 @@
 
   var KP = {
     SOURCE_NAME: SOURCE,
-    main: main,
-    menu: menu,
-    menuCategory: menuCategory,
-    full: full,
-    list: list,
-    category: category,
     search: search,
     discovery: discovery,
-    person: person,
+    list: list,
+    full: full,
     seasons: seasons,
-    company: company,
-    favorite: favorite,
+    main: emptyMain,
+    category: emptyCategory,
+    menu: emptyMenu,
+    menuCategory: emptyMenu,
+    person: person,
+    company: emptyCategory,
+    favorite: emptyCategory,
     clear: clear,
     img: img
   };
 
   // ===========================================================================
-  // Настройки плагина
+  // Настройки
   // ===========================================================================
 
-  function settingsHtml() {
-    return '<div class="settings-param selector" data-name="kp_token" data-type="input" data-string="true">' +
-      '<div class="settings-param__name">Токен API</div>' +
-      '<div class="settings-param__value"></div>' +
-      '<div class="settings-param__descr">Свой токен из бота @poiskkinodev_bot. Пусто — встроенный.</div>' +
-      '</div>';
+  function quotaLine() {
+    var parts = [], i, p;
+    for (i = 0; i < PROVIDERS.length; i++) {
+      p = PROVIDERS[i];
+      parts.push(p.name + ': ' + (tokenOf(p) ? (quotaUsed(p) + '/' + limitOf(p)) : 'нет токена'));
+    }
+    return parts.join('   ');
   }
 
   function addSettings() {
@@ -965,25 +816,30 @@
 
     Lampa.SettingsApi.addParam({
       component: 'kinopoisk',
-      param: { name: 'kp_token', type: 'input', values: '', placeholder: 'Оставьте пустым для встроенного токена', default: '' },
-      field: { name: 'Токен API', description: 'Личный токен из бота @poiskkinodev_bot' },
-      onChange: function () { cacheClear(); }
+      param: { name: 'kp_token', type: 'input', values: '', default: '' },
+      field: {
+        name: 'Токен kinopoisk.dev',
+        description: '200 запросов в сутки. Пусто — общий встроенный токен, его лимит делят все. Бот @poiskkinodev_bot'
+      },
+      onChange: cacheClear
     });
 
     Lampa.SettingsApi.addParam({
       component: 'kinopoisk',
-      param: { name: 'kp_quota_limit', type: 'select', values: { 200: '200 (бесплатный)', 500: '500', 5000: '5000', 100000: 'Без ограничений' }, default: 200 },
-      field: { name: 'Суточный лимит запросов', description: 'Плагин перестаёт ходить в сеть, когда лимит исчерпан, и показывает сохранённые данные' }
+      param: { name: 'kp_token_unofficial', type: 'input', values: '', default: '' },
+      field: {
+        name: 'Токен kinopoiskapiunofficial.tech',
+        description: 'Ещё 500 запросов в сутки. Регистрация на kinopoiskapiunofficial.tech занимает минуту. Пусто — провайдер не используется'
+      },
+      onChange: cacheClear
     });
 
     Lampa.SettingsApi.addParam({
       component: 'kinopoisk',
       param: { name: 'kp_quota_view', type: 'static' },
-      field: { name: 'Израсходовано сегодня', description: 'Счётчик обнуляется раз в сутки' },
+      field: { name: 'Израсходовано сегодня', description: 'По каждому токену отдельно, обнуляется раз в сутки' },
       onRender: function (item) {
-        setTimeout(function () {
-          item.find('.settings-param__value').text(quotaUsed() + ' из ' + quotaLimit());
-        }, 0);
+        setTimeout(function () { item.find('.settings-param__value').text(quotaLine()); }, 0);
       }
     });
 
@@ -999,44 +855,18 @@
   }
 
   // ===========================================================================
-  // Меню и запуск
+  // Запуск
   // ===========================================================================
-
-  var ICON =
-    '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-    '<circle cx="12" cy="12" r="9.2" stroke="currentColor" stroke-width="1.6"/>' +
-    '<path d="M10 7.4h1.9v3.9l2.8-3.9h2.2l-3.2 4.3 3.4 4.9h-2.3l-2.9-4.4v4.4H10V7.4z" fill="currentColor"/></svg>';
-
-  function openCatalog() {
-    Lampa.Activity.push({
-      url: '',
-      title: 'Кинопоиск',
-      component: 'main',
-      source: SOURCE,
-      page: 1
-    });
-  }
-
-  function addMenuItem() {
-    var item = $(
-      '<li class="menu__item selector" data-action="kinopoisk">' +
-      '<div class="menu__ico">' + ICON + '</div>' +
-      '<div class="menu__text">Кинопоиск</div>' +
-      '</li>'
-    );
-    item.on('hover:enter', openCatalog);
-    $('.menu .menu__list').eq(0).append(item);
-  }
 
   function registerSource() {
     if (!Lampa.Api || !Lampa.Api.sources) return false;
-    // tmdb и cub защищены геттерами, но новые ключи объекту добавляются.
     Lampa.Api.sources[SOURCE] = KP;
-    // Источник в общем списке настроек — тогда Кинопоиск можно сделать
-    // основным для всего приложения, а не только для своего пункта меню.
-    if (Lampa.Params && Lampa.Params.select) {
-      Lampa.Params.select('source', { tmdb: 'TMDB', cub: 'CUB', kp: 'Кинопоиск' }, 'tmdb');
-    }
+
+    // Прошлая версия добавляла Кинопоиск в общий выбор источника. Каталога
+    // больше нет, так что выбранный «kp» дал бы пустую главную — возвращаем
+    // такого пользователя на TMDB.
+    if (storageGet('source', 'tmdb') === SOURCE) storageSet('source', 'tmdb');
+
     return Lampa.Api.sources[SOURCE] === KP;
   }
 
@@ -1050,47 +880,37 @@
     }
 
     addSettings();
-    addMenuItem();
   }
 
   if (window.appready) start();
   else Lampa.Listener.follow('app', function (e) { if (e.type === 'ready') start(); });
 
-  // --- хук для тестов (в браузере `module` не существует, блок не исполняется) ---
+  // --- хук для тестов (в браузере `module` не существует) ---
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       KP: KP,
-      _toCard: toCard,
-      _toCards: toCards,
-      _toPage: toPage,
-      _toMovie: toMovie,
-      _toSeason: toSeason,
+      PROVIDERS: PROVIDERS,
+      _KPDEV: KPDEV,
+      _KPU: KPU,
+      _devCard: devCard,
+      _devMovie: devMovie,
+      _devPersons: devPersons,
+      _unofficialCard: unofficialCard,
+      _unofficialIsSeries: unofficialIsSeries,
       _applySeasons: applySeasons,
       _lastSeason: lastSeason,
-      _loadSeasonMap: loadSeasonMap,
-      _toEpisode: toEpisode,
-      _isSeries: isSeries,
-      _splitPersons: splitPersons,
-      _personCredits: personCredits,
-      _catalogRows: catalogRows,
-      _genreRows: genreRows,
-      _allRows: allRows,
-      _listPath: listPath,
-      _searchPath: searchPath,
-      _seasonPath: seasonPath,
-      _fieldsQuery: fieldsQuery,
+      _searchQuery: searchQuery,
       _get: get,
-      _token: token,
+      _tokenOf: tokenOf,
+      _limitOf: limitOf,
       _quotaUsed: quotaUsed,
       _quotaLeft: quotaLeft,
       _quotaSpend: quotaSpend,
       _quotaExhaust: quotaExhaust,
+      _availableProviders: availableProviders,
       _cacheGet: cacheGet,
-      _cacheSet: cacheSet,
       _cacheClear: cacheClear,
       _registerSource: registerSource,
-      _addMenuItem: addMenuItem,
-      _openCatalog: openCatalog,
       _start: start
     };
   }

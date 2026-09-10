@@ -1,14 +1,14 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { makeMock, loadPlugin } = require('./helpers/lampa-mock');
+const { makeMock, makeDualMock, loadPlugin } = require('./helpers/lampa-mock');
 
 function searchOf(mock, params) {
   const { KP } = loadPlugin(mock);
   return new Promise((done) => KP.search(params, done, () => done([])));
 }
 
-test('search splits the Kinopoisk answer into a movie row and a series row', async () => {
+test('search splits the answer into a movie row and a series row', async () => {
   const rows = await searchOf(makeMock(), { query: 'джентльмены' });
 
   assert.strictEqual(rows.length, 2);
@@ -20,40 +20,62 @@ test('search splits the Kinopoisk answer into a movie row and a series row', asy
   assert.ok(rows[1].results.every((c) => c.original_name));
 });
 
+test('the unofficial provider splits movies and series the same way', async () => {
+  const mock = makeDualMock({
+    responder: (url) => (url.indexOf('poiskkino') >= 0 ? { __error: 403 } : undefined)
+  });
+  // fall through to the mock's default unofficial fixtures
+  const rows = await searchOf(makeDualMock({
+    responder: (url) => {
+      if (url.indexOf('poiskkino') >= 0) return { __error: 403 };
+      return { pagesCount: 1, films: [
+        { filmId: 1, nameRu: 'Кино', type: 'FILM', year: '2020' },
+        { filmId: 2, nameRu: 'Сериал', nameOriginal: 'Series', type: 'TV_SERIES', year: '2021' }
+      ] };
+    }
+  }), { query: 'x' });
+
+  assert.strictEqual(rows.length, 2);
+  assert.strictEqual(rows[0].results[0].title, 'Кино');
+  assert.strictEqual(rows[1].results[0].name, 'Сериал');
+});
+
 test('a row is omitted entirely when nothing of that kind was found', async () => {
-  const mock = makeMock({ responder: () => ({ docs: [{ id: 1, name: 'Фильм', type: 'movie', rating: {}, votes: {} }] }) });
+  const mock = makeMock({ responder: () => ({ docs: [{ id: 1, name: 'Фильм', type: 'movie', rating: {}, votes: {} }], pages: 1 }) });
   const rows = await searchOf(mock, { query: 'что-то' });
 
   assert.strictEqual(rows.length, 1);
   assert.strictEqual(rows[0].title, 'Фильмы');
 });
 
-test('the query is percent-encoded on the way out — Cyrillic in a raw url breaks the request', async () => {
-  const mock = makeMock();
-  await searchOf(mock, { query: 'джентльмены' });
+test('the query is percent-encoded on the way out for both providers', async () => {
+  const mock = makeDualMock({
+    responder: (url) => (url.indexOf('poiskkino') >= 0 ? { __error: 403 } : { films: [] })
+  });
+  await searchOf(mock, { query: 'завод' });
 
-  const url = mock.calls.requests[0].url;
-  assert.ok(url.indexOf('query=%D0%B4') >= 0, 'expected an encoded query, got: ' + url);
+  mock.calls.requests.forEach((r) => {
+    assert.ok(/%D0%B7/.test(r.url), 'cyrillic must be encoded in ' + r.provider + ': ' + r.url);
+  });
 });
 
 test('a query that arrives already encoded is not double-encoded', async () => {
   const mock = makeMock();
-  await searchOf(mock, { query: encodeURIComponent('джентльмены') });
+  await searchOf(mock, { query: encodeURIComponent('завод') });
 
   const url = mock.calls.requests[0].url;
-  assert.ok(url.indexOf('query=%D0%B4') >= 0);
+  assert.ok(/query=%D0%B7/.test(url));
   assert.ok(url.indexOf('%25') < 0, 'double encoding leaked in: ' + url);
 });
 
 test('a bare percent sign in the query does not throw', async () => {
-  const mock = makeMock();
-  const rows = await searchOf(mock, { query: '100% любви' });
+  const rows = await searchOf(makeMock(), { query: '100% любви' });
   assert.ok(Array.isArray(rows));
 });
 
 test('an empty query answers with no rows and spends nothing', async () => {
   const mock = makeMock();
-  const rows = await searchOf(mock, { query: '' });
+  const rows = await searchOf(mock, { query: '   ' });
 
   assert.deepStrictEqual(rows, []);
   assert.strictEqual(mock.calls.requests.length, 0);
@@ -69,7 +91,7 @@ test('discovery() puts a Kinopoisk tab into the global search', () => {
   assert.strictEqual(typeof d.onCancel, 'function');
 });
 
-test('"more" from the search tab opens a Kinopoisk grid, not a TMDB one', () => {
+test('"more" from the search tab opens a Kinopoisk grid', () => {
   const mock = makeMock();
   const { KP } = loadPlugin(mock);
   let closed = false;
@@ -83,30 +105,34 @@ test('"more" from the search tab opens a Kinopoisk grid, not a TMDB one', () => 
   assert.strictEqual(decodeURIComponent(push.query), 'матрица');
 });
 
-test('the actor page maps a Kinopoisk person into the structure Lampa expects', async () => {
+test('the "more" grid pages through the same search', async () => {
   const mock = makeMock();
   const { KP } = loadPlugin(mock);
 
-  const data = await new Promise((done) => KP.person({ id: 797 }, done, () => done(null)));
+  const page = await new Promise((done) => KP.list({ query: encodeURIComponent('завод'), page: 2 }, done, done));
 
-  assert.ok(data.person, 'data.person renders the header');
-  assert.strictEqual(data.person.name, 'Мэттью Макконахи');
-  assert.strictEqual(data.person.birthday, '1969-11-04');
-  assert.strictEqual(data.person.img, 'https://kp/p/797');
-
-  assert.ok(data.credits, 'data.credits renders the filmography');
-  assert.strictEqual(data.credits.cast.length, 1);
-  assert.strictEqual(data.credits.cast[0].title, 'Джентльмены');
-  assert.strictEqual(data.credits.cast[0].source, 'kp');
-  assert.ok(data.credits.knownFor.length);
+  assert.strictEqual(page.source, 'kp');
+  assert.strictEqual(page.total_pages, 3);
+  assert.ok(page.results.length);
+  assert.ok(mock.calls.requests[0].url.indexOf('page=2') >= 0, 'the requested page must reach the API');
 });
 
-test('menuCategory offers Kinopoisk queries for the Movies and Series menu items', async () => {
-  const { KP } = loadPlugin(makeMock());
+test('the grid asks for nothing when there is no query', async () => {
+  const mock = makeMock();
+  const { KP } = loadPlugin(mock);
 
-  const movies = await new Promise((done) => KP.menuCategory({ action: 'movie' }, done));
-  const series = await new Promise((done) => KP.menuCategory({ action: 'tv' }, done));
+  const page = await new Promise((done) => KP.list({}, done, done));
 
-  assert.ok(movies.every((m) => m.url.indexOf('type=movie') === 0 && m.source === 'kp'));
-  assert.ok(series.every((m) => m.url.indexOf('type=tv-series') === 0 && m.source === 'kp'));
+  assert.deepStrictEqual(page.results, []);
+  assert.strictEqual(mock.calls.requests.length, 0);
+});
+
+test('a failed search reports failure rather than pretending nothing was found', async () => {
+  // The tab showing "0" for an exhausted quota is exactly what sent the user
+  // looking for a bad token.
+  const mock = makeMock({ responder: () => ({ __error: 403 }) });
+  const { KP } = loadPlugin(mock);
+
+  const failed = await new Promise((resolve) => KP.search({ query: 'завод' }, () => resolve(false), () => resolve(true)));
+  assert.strictEqual(failed, true);
 });
