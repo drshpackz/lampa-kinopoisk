@@ -1,0 +1,9 @@
+{
+  "name": "lampa-kinopoisk",
+  "version": "1.0.0",
+  "description": "Lampa TV plugin: Kinopoisk as a first-class catalog source (rows, grids, cards, search, seasons)",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
