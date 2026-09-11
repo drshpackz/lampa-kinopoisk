@@ -401,6 +401,28 @@
     return cleanString(storageGet(provider.token_key, '')) || provider.token_default;
   }
 
+  // ---------------------------------------------------------------------------
+  // Режим сервера-посредника (server/kp-proxy.js).
+  //
+  // Если в настройках указан адрес своего сервера, плагин ходит к нему по тем
+  // же путям с префиксом провайдера (<сервер>/kpdev/…, <сервер>/kpu/…). Ключи
+  // живут на сервере, кеш там общий для всех устройств, поэтому здесь не нужны
+  // ни локальные токены, ни локальный счёт лимита. Отказ 403 от сервера значит
+  // то же, что и от самого API: у этого провайдера на сегодня ключи кончились.
+  // ---------------------------------------------------------------------------
+
+  function proxyBase() {
+    var url = cleanString(storageGet('kp_proxy', ''));
+    if (!url) return '';
+    if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
+    return url.replace(/\/+$/, '');
+  }
+
+  function hostOf(provider) {
+    var proxy = proxyBase();
+    return proxy ? (proxy + '/' + provider.name + '/') : provider.host;
+  }
+
   function limitOf(provider) {
     var n = parseInt(storageGet(provider.limit_key, provider.limit_default), 10);
     return (n > 0) ? n : provider.limit_default;
@@ -420,6 +442,9 @@
   function quotaUsed(provider) { return quotaState(provider).used; }
 
   function quotaSpend(provider) {
+    // Через сервер большая часть запросов — попадания в его кеш; считать их
+    // здесь значило бы упереться в лимит, которого на деле нет.
+    if (proxyBase()) return;
     var q = quotaState(provider);
     q.used++;
     storageSet('kp_quota_' + provider.name, q);
@@ -440,8 +465,9 @@
   /** Провайдеры, которыми сейчас есть смысл ходить: с токеном и с остатком. */
   function availableProviders() {
     var out = [], i;
+    var proxied = !!proxyBase(); // ключи у сервера — локальный токен не нужен
     for (i = 0; i < PROVIDERS.length; i++) {
-      if (tokenOf(PROVIDERS[i]) && quotaLeft(PROVIDERS[i]) > 0) out.push(PROVIDERS[i]);
+      if ((proxied || tokenOf(PROVIDERS[i])) && quotaLeft(PROVIDERS[i]) > 0) out.push(PROVIDERS[i]);
     }
     return out;
   }
@@ -551,7 +577,7 @@
   function requestOne(provider, path, parse, done, fail) {
     queue.push(function (release) {
       quotaSpend(provider);
-      net().silent(provider.host + path, function (json) {
+      net().silent(hostOf(provider) + path, function (json) {
         release();
         var data;
         try { data = parse(json); }
@@ -566,7 +592,9 @@
         fail({ status: status || -1, provider: provider.name });
       }, false, {
         dataType: 'json',
-        headers: { 'X-API-KEY': tokenOf(provider) },
+        // Серверу ключ не передаём: он подставляет свой. Лишний заголовок ещё
+        // и заставил бы браузер делать CORS-preflight на каждый запрос.
+        headers: proxyBase() ? {} : { 'X-API-KEY': tokenOf(provider) },
         cache: { life: LIFE.full }
       });
     });
@@ -574,6 +602,11 @@
   }
 
   function warnNoBudget() {
+    if (proxyBase()) {
+      notyOnce('kp_proxy_no_budget', 'Кинопоиск: у сервера-посредника на сегодня кончились ключи. ' +
+        'Добавьте ключ в его настройки (KPDEV_TOKENS / KPU_TOKENS). Показаны сохранённые данные.');
+      return;
+    }
     var withToken = 0, i;
     for (i = 0; i < PROVIDERS.length; i++) if (tokenOf(PROVIDERS[i])) withToken++;
     if (withToken < PROVIDERS.length) {
@@ -894,6 +927,16 @@
 
     Lampa.SettingsApi.addParam({
       component: 'kinopoisk',
+      param: { name: 'kp_proxy', type: 'input', values: '', default: '' },
+      field: {
+        name: 'Адрес своего сервера',
+        description: 'Необязательно. Если запущен kp-proxy — ключи и общий кеш живут на нём, и лимит перестаёт заканчиваться. Например https://kp.example.com'
+      },
+      onChange: cacheClear
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'kinopoisk',
       param: { name: 'kp_quota_view', type: 'static' },
       field: { name: 'Израсходовано сегодня', description: 'По каждому токену отдельно, обнуляется раз в сутки' },
       onRender: function (item) {
@@ -970,6 +1013,8 @@
       _cacheGet: cacheGet,
       _cacheClear: cacheClear,
       _ensureMovie: ensureMovie,
+      _proxyBase: proxyBase,
+      _hostOf: hostOf,
       _CACHE_KEY: CACHE_KEY,
       _registerSource: registerSource,
       _start: start

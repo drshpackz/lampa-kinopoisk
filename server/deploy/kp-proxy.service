@@ -1,0 +1,35 @@
+# systemd-юнит для server/kp-proxy.js
+#
+#   sudo cp server/deploy/kp-proxy.service /etc/systemd/system/
+#   sudo install -m 600 server/deploy/kp-proxy.env.example /etc/kp-proxy.env  # и вписать ключи
+#   sudo systemctl daemon-reload && sudo systemctl enable --now kp-proxy
+#   curl -s http://127.0.0.1:8787/health
+#
+# Путь к репозиторию (/opt/lampa-kinopoisk) и к node (/usr/bin/node) поправьте
+# под свой сервер: `which node`.
+
+[Unit]
+Description=Kinopoisk caching proxy for the Lampa plugin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Отдельный временный пользователь без прав: серверу нужен только кеш.
+DynamicUser=yes
+CacheDirectory=kp-proxy
+EnvironmentFile=/etc/kp-proxy.env
+Environment=PORT=8787
+Environment=HOST=127.0.0.1
+Environment=CACHE_DIR=/var/cache/kp-proxy
+ExecStart=/usr/bin/node /opt/lampa-kinopoisk/server/kp-proxy.js
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
