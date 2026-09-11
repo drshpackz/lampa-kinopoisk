@@ -454,9 +454,23 @@
   // запроса (kind) — один путь может читаться по-разному.
   // ===========================================================================
 
-  var CACHE_KEY = 'kp_cache';
+  // Версия в ключе — не украшение. Кешируется РАЗОБРАННАЯ карточка, то есть
+  // её форма, а форма меняется вместе с кодом. Без версии новая сборка плагина
+  // неделю отдавала бы карточки, собранные старой, — ровно так пережила
+  // исправление карточка без production_companies. Меняется форма того, что
+  // кладётся в кеш, — поднимается версия.
+  var CACHE_KEY = 'kp_cache_v2';
+  var LEGACY_CACHE_KEYS = ['kp_cache'];
   var CACHE_LIMIT = 90;
   var memory = {};
+
+  /** Освободить localStorage от кешей прошлых версий. */
+  function dropLegacyCache() {
+    var i;
+    for (i = 0; i < LEGACY_CACHE_KEYS.length; i++) {
+      if (storageGet(LEGACY_CACHE_KEYS[i], null) !== null) storageSet(LEGACY_CACHE_KEYS[i], null);
+    }
+  }
 
   function cacheRead() {
     var c = storageGet(CACHE_KEY, null);
@@ -733,6 +747,29 @@
     return movie;
   }
 
+  /**
+   * Последний рубеж перед Lampa. Модули полной карточки обращаются к
+   * card.genres.length, card.genres.slice, card.production_companies.length и
+   * card.title.length БЕЗ проверки на undefined; исключение Lampa глотает, и
+   * карточка навсегда остаётся на спиннере. Поэтому форма гарантируется здесь,
+   * на выходе, независимо от того, откуда пришли данные — свежий ответ,
+   * кеш прошлой версии или провайдер, который однажды переименует поле.
+   */
+  function ensureMovie(movie) {
+    movie = movie || {};
+    if (!Array.isArray(movie.genres)) movie.genres = [];
+    if (!Array.isArray(movie.production_companies)) movie.production_companies = [];
+    if (!Array.isArray(movie.production_countries)) movie.production_countries = [];
+    if (movie.original_name) {
+      // Сериал: Lampa сама подставит title из name, но только если name есть.
+      if (typeof movie.name !== 'string') movie.name = movie.original_name;
+    } else if (typeof movie.title !== 'string') {
+      movie.title = movie.original_title || movie.name || '';
+    }
+    if (typeof movie.overview !== 'string') movie.overview = '';
+    return movie;
+  }
+
   function full(params, oncomplite, onerror) {
     params = params || {};
     var id = params.id || (params.card && params.card.id);
@@ -741,7 +778,12 @@
     get('full', '' + id, LIFE.full, function (provider) {
       return { path: provider.fullPath(id), parse: provider.parseFull };
     }, function (data) {
-      var out = { movie: data.movie, persons: data.persons, simular: data.simular, source: SOURCE };
+      var out = {
+        movie: ensureMovie(data.movie),
+        persons: data.persons || { id: 0, cast: [], crew: [] },
+        simular: data.simular || { results: [] },
+        source: SOURCE
+      };
       if (!out.movie.original_name) { oncomplite(out); return; }
 
       // Ни один из двух API не отдаёт сезоны вместе с карточкой, так что для
@@ -895,6 +937,7 @@
       return;
     }
 
+    dropLegacyCache();
     addSettings();
   }
 
@@ -926,6 +969,8 @@
       _availableProviders: availableProviders,
       _cacheGet: cacheGet,
       _cacheClear: cacheClear,
+      _ensureMovie: ensureMovie,
+      _CACHE_KEY: CACHE_KEY,
       _registerSource: registerSource,
       _start: start
     };

@@ -81,9 +81,9 @@ test('changing either token clears the cache', () => {
   plugin._start();
 
   ['kp_token', 'kp_token_unofficial'].forEach((name) => {
-    mock.store.kp_cache = { 'search|x': { until: Date.now() + 1e6, at: Date.now(), data: 1 } };
+    mock.store[plugin._CACHE_KEY] = { 'search|x': { until: Date.now() + 1e6, at: Date.now(), data: 1 } };
     mock.calls.settingsParams.find((p) => p.param.name === name).onChange();
-    assert.deepStrictEqual(mock.store.kp_cache, {}, name + ' must invalidate cached answers');
+    assert.deepStrictEqual(mock.store[plugin._CACHE_KEY], {}, name + ' must invalidate cached answers');
   });
 });
 
