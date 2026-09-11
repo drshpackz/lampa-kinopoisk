@@ -567,6 +567,9 @@
     pump();
   }
 
+  /** Выполнить на следующем витке цикла событий — никогда не синхронно. */
+  function later(fn) { setTimeout(fn, 0); }
+
   function notyOnce(flag, message) {
     if (window[flag]) return;
     window[flag] = true;
@@ -627,15 +630,22 @@
    */
   function get(kind, key, life, build, done, fail) {
     var cache_key = kind + '|' + key;
+    // Ответ из кеша отдаётся АСИНХРОННО, как из сети. Синхронный колбэк
+    // срабатывает прямо внутри вызова Lampa, пока полная карточка ещё не
+    // достроена, и сторонние плагины, которые добавляют кнопки источников
+    // (из них собирается «Смотреть»), не успевают: первое открытие карточки
+    // шло по сети и кнопка была, а каждое следующее — из кеша, и её не было.
     var cached = cacheGet(cache_key);
-    if (cached !== null) { done(cached); return; }
+    if (cached !== null) { later(function () { done(cached); }); return; }
 
     var list = availableProviders();
     if (!list.length) {
       var stale = cacheGetStale(cache_key);
       warnNoBudget();
-      if (stale !== null) done(stale);
-      else fail({ status: 429, quota: true });
+      later(function () {
+        if (stale !== null) done(stale);
+        else fail({ status: 429, quota: true });
+      });
       return;
     }
 
